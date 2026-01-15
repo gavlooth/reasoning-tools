@@ -199,12 +199,11 @@ GLM_MODEL = "glm-4"
 }
 ```
 
-**Claude Code** (`~/.claude/settings.json`):
+**Claude Code** (`.mcp.json` in project root):
 ```json
 {
   "mcpServers": {
     "reasoning-tools": {
-      "type": "stdio",
       "command": "reasoning-tools",
       "args": [],
       "env": {
@@ -218,7 +217,7 @@ GLM_MODEL = "glm-4"
 
 Or add via CLI:
 ```bash
-claude mcp add reasoning-tools --scope user -- reasoning-tools
+claude mcp add reasoning-tools -- reasoning-tools
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`):
