@@ -21,7 +21,7 @@ func main() {
 	)
 
 	// Register simple sequential thinking tool
-	simpleTool := mcp.NewTool("sequential_think",
+	simpleTool := mcp.NewTool("sequential_thinking",
 		mcp.WithDescription("Simple sequential chain-of-thought reasoning. "+
 			"Good for straightforward problems. Uses linear thinking without branching."),
 		mcp.WithString("problem",
@@ -206,7 +206,7 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 	}
 
 	// Setup streaming
-	sm := NewStreamingManager("sequential_think")
+	sm := NewStreamingManager("sequential_thinking")
 
 	// Create client and run sequential thinking
 	client := &SequentialClient{provider: provider}
