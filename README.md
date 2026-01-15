@@ -199,7 +199,7 @@ GLM_MODEL = "glm-4"
 }
 ```
 
-**Claude Code** (`~/.claude.json`):
+**Claude Code** (`~/.claude/settings.json`):
 ```json
 {
   "mcpServers": {
