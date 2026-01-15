@@ -172,12 +172,12 @@ export ZAI_BASE_URL="..."            # Custom endpoint for z.ai
 
 **Codex** (`~/.codex/config.toml`):
 ```toml
-[mcp_servers.sequential-thinking]
+[mcp_servers.reasoning-tools]
 command = "reasoning-tools"
 args = []
 disabled = false
 
-[mcp_servers.sequential-thinking.env]
+[mcp_servers.reasoning-tools.env]
 ZAI_API_KEY = "your-key"
 ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
 GLM_MODEL = "glm-4"
@@ -187,10 +187,64 @@ GLM_MODEL = "glm-4"
 ```json
 {
   "mcp": {
-    "sequential-thinking": {
+    "reasoning-tools": {
       "type": "local",
       "command": ["reasoning-tools"],
       "environment": {
+        "ZAI_API_KEY": "your-key",
+        "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
+      }
+    }
+  }
+}
+```
+
+**Claude Code** (`~/.claude.json`):
+```json
+{
+  "mcpServers": {
+    "reasoning-tools": {
+      "type": "stdio",
+      "command": "reasoning-tools",
+      "args": [],
+      "env": {
+        "ZAI_API_KEY": "your-key",
+        "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
+      }
+    }
+  }
+}
+```
+
+Or add via CLI:
+```bash
+claude mcp add reasoning-tools --scope user -- reasoning-tools
+```
+
+**Gemini CLI** (`~/.gemini/settings.json`):
+```json
+{
+  "mcpServers": {
+    "reasoning-tools": {
+      "command": "reasoning-tools",
+      "args": [],
+      "env": {
+        "ZAI_API_KEY": "your-key",
+        "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
+      }
+    }
+  }
+}
+```
+
+Or for project-specific config (`.gemini/settings.json`):
+```json
+{
+  "mcpServers": {
+    "reasoning-tools": {
+      "command": "reasoning-tools",
+      "args": [],
+      "env": {
         "ZAI_API_KEY": "your-key",
         "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
       }
