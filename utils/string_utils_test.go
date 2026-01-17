@@ -104,13 +104,13 @@ func TestTruncateStrBytesSafe(t *testing.T) {
 func TestTruncateStrUTF8Safety(t *testing.T) {
 	// Test that we never produce invalid UTF-8
 	testCases := []string{
-		"Hello 世界",       // Chinese characters (3 bytes each)
-		"Привет мир",      // Cyrillic (2 bytes each)
-		"مرحبا",           // Arabic
-		"こんにちは",        // Japanese Hiragana (3 bytes each)
-		"😀😁😂🤣😃😄😅😆",  // Emoji (4 bytes each)
-		"école",           // Combining diacritics
-		"â",               // Combining circumflex
+		"Hello 世界",   // Chinese characters (3 bytes each)
+		"Привет мир", // Cyrillic (2 bytes each)
+		"مرحبا",      // Arabic
+		"こんにちは",      // Japanese Hiragana (3 bytes each)
+		"😀😁😂🤣😃😄😅😆",   // Emoji (4 bytes each)
+		"école",     // Combining diacritics
+		"â",         // Combining circumflex
 	}
 
 	for _, input := range testCases {

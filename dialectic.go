@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -17,6 +18,7 @@ type DialecticalReasoner struct {
 	config        DialecticConfig
 	tools         *ToolRegistry
 	toolCalls     int
+	toolCallsMu   sync.Mutex
 	onProgress    func(ProgressUpdate)
 	onToken       func(token string)
 	enableStreams bool
@@ -65,9 +67,9 @@ type Claim struct {
 type VerificationStatus string
 
 const (
-	StatusVerified  VerificationStatus = "verified"   // Successfully verified
+	StatusVerified   VerificationStatus = "verified"   // Successfully verified
 	StatusUnverified VerificationStatus = "unverified" // Verification attempted but failed
-	StatusSkipped   VerificationStatus = "skipped"    // Verification not attempted
+	StatusSkipped    VerificationStatus = "skipped"    // Verification not attempted
 )
 
 // Verification represents the result of verifying a claim
@@ -225,7 +227,9 @@ func (d *DialecticalReasoner) Reason(ctx context.Context, problem string) (*Dial
 			result.Confidence = synthesisVerification.Score
 			result.Success = true
 			result.TotalRounds = round
+			d.toolCallsMu.Lock()
 			result.TotalToolCalls = d.toolCalls
+			d.toolCallsMu.Unlock()
 			d.countToolsUsed(result)
 			return result, nil
 		}
@@ -245,7 +249,9 @@ func (d *DialecticalReasoner) Reason(ctx context.Context, problem string) (*Dial
 		result.Confidence = lastStep.Synthesis.Verification.Score
 	}
 	result.Success = result.Confidence >= d.config.VerifyThreshold
+	d.toolCallsMu.Lock()
 	result.TotalToolCalls = d.toolCalls
+	d.toolCallsMu.Unlock()
 	d.countToolsUsed(result)
 
 	return result, nil
@@ -568,7 +574,9 @@ Only suggest tools if they would genuinely help verify the claim. Respond with [
 		}
 
 		result := d.tools.Execute(ctx, tc.Tool, tc.Input)
+		d.toolCallsMu.Lock()
 		d.toolCalls++
+		d.toolCallsMu.Unlock()
 		results = append(results, result)
 
 		d.emitProgress(ProgressUpdate{

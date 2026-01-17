@@ -185,11 +185,11 @@ func TestLoadConfigWithInvalidValues(t *testing.T) {
 
 func TestLoadConfigClampsOutOfRangeValues(t *testing.T) {
 	tests := []struct {
-		name              string
-		envVar            string
-		value             string
-		field             string
-		expectedClamped   time.Duration
+		name            string
+		envVar          string
+		value           string
+		field           string
+		expectedClamped time.Duration
 	}{
 		// Below minimum (1 second)
 		{"Below minimum", "OPENAI_TIMEOUT", "0", "OpenAITimeout", 120 * time.Second}, // Falls back to default (s > 0 check)

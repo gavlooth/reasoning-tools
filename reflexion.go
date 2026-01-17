@@ -23,6 +23,7 @@ type Reflexion struct {
 	memory        *EpisodicMemory
 	tools         *ToolRegistry
 	toolCalls     int
+	toolCallsMu   sync.Mutex
 	onProgress    func(ProgressUpdate)
 	onToken       func(token string)
 	enableStreams bool
@@ -40,15 +41,15 @@ func (r *Reflexion) SetEnableStreaming(enable bool) {
 
 // ReflexionConfig configures the reflexion process
 type ReflexionConfig struct {
-	MaxAttempts           int         // Maximum reasoning attempts before giving up (default: 3)
-	MaxThoughtsPerAttempt int         // Max thoughts per attempt (default: 10)
-	MemoryPath            string      // Path to store episodic memory (default: ~/.local/share/reasoning-tools/memory.json)
-	LearnFromPast         bool        // Whether to query past failures (default: true)
-	Temperature           float64     // LLM temperature (default: 0.7)
-	EnableTools           bool        // Enable tool usage during reasoning
-	MaxToolCalls          int         // Maximum tool calls per attempt (default: 5)
-	EnabledTools          []string    // Which tools to enable (empty = all)
-	MaxEpisodes           int         // Maximum episodes to keep in memory (default: 100, 0 = unlimited)
+	MaxAttempts           int           // Maximum reasoning attempts before giving up (default: 3)
+	MaxThoughtsPerAttempt int           // Max thoughts per attempt (default: 10)
+	MemoryPath            string        // Path to store episodic memory (default: ~/.local/share/reasoning-tools/memory.json)
+	LearnFromPast         bool          // Whether to query past failures (default: true)
+	Temperature           float64       // LLM temperature (default: 0.7)
+	EnableTools           bool          // Enable tool usage during reasoning
+	MaxToolCalls          int           // Maximum tool calls per attempt (default: 5)
+	EnabledTools          []string      // Which tools to enable (empty = all)
+	MaxEpisodes           int           // Maximum episodes to keep in memory (default: 100, 0 = unlimited)
 	EpisodeTTL            time.Duration // Time-to-live for episodes (default: 0 = no expiration)
 }
 
@@ -61,8 +62,8 @@ func DefaultReflexionConfig() ReflexionConfig {
 		MemoryPath:            filepath.Join(homeDir, ".local", "share", "reasoning-tools", "memory.json"),
 		LearnFromPast:         true,
 		Temperature:           0.7,
-		MaxEpisodes:           100,             // Keep up to 100 episodes
-		EpisodeTTL:            0,               // No TTL by default (episodes kept indefinitely until max limit)
+		MaxEpisodes:           100, // Keep up to 100 episodes
+		EpisodeTTL:            0,   // No TTL by default (episodes kept indefinitely until max limit)
 	}
 }
 
@@ -224,7 +225,9 @@ func (r *Reflexion) Reason(ctx context.Context, problem string) (*ReflexionResul
 			result.FinalAnswer = answer
 			result.Success = true
 			result.TotalAttempts = attemptNum
+			r.toolCallsMu.Lock()
 			result.TotalToolCalls = r.toolCalls
+			r.toolCallsMu.Unlock()
 
 			// Store successful episode
 			r.storeEpisode(problem, attemptNum, thoughts, answer, true, "", "")
@@ -259,7 +262,9 @@ func (r *Reflexion) Reason(ctx context.Context, problem string) (*ReflexionResul
 
 	// All attempts failed
 	result.TotalAttempts = r.config.MaxAttempts
+	r.toolCallsMu.Lock()
 	result.TotalToolCalls = r.toolCalls
+	r.toolCallsMu.Unlock()
 	if len(result.Attempts) > 0 {
 		// Use the last attempt's answer
 		result.FinalAnswer = result.Attempts[len(result.Attempts)-1].Answer
@@ -401,7 +406,9 @@ For each step, output a JSON object:
 				result := r.tools.Execute(ctx, toolStep.Tool, toolStep.Input)
 				toolResults = append(toolResults, result)
 				attemptToolCalls++
+				r.toolCallsMu.Lock()
 				r.toolCalls++
+				r.toolCallsMu.Unlock()
 
 				r.emitProgress(ProgressUpdate{
 					Type:       "tool",

@@ -22,6 +22,7 @@ type GraphOfThoughts struct {
 	nodesMu       sync.RWMutex
 	totalVisits   int
 	toolCalls     int
+	toolCallsMu   sync.Mutex
 	onProgress    func(ProgressUpdate)
 	onToken       func(token string)
 	enableStreams bool
@@ -206,7 +207,9 @@ func (g *GraphOfThoughts) Solve(ctx context.Context, problem string) (*GoTResult
 			if action.Type == "tool" && g.config.EnableTools && g.tools != nil && g.toolCalls < g.config.MaxToolCalls {
 				// Execute tool and create tool node
 				toolResult := g.tools.Execute(ctx, action.Tool, action.Input)
+				g.toolCallsMu.Lock()
 				g.toolCalls++
+				g.toolCallsMu.Unlock()
 				result.ToolsUsed[action.Tool]++
 
 				// Determine score based on tool success
@@ -341,7 +344,9 @@ func (g *GraphOfThoughts) Solve(ctx context.Context, problem string) (*GoTResult
 	result.Graph = g.nodes
 	result.TotalNodes = len(g.nodes)
 	result.MergeCount = mergeCount
+	g.toolCallsMu.Lock()
 	result.TotalToolCalls = g.toolCalls
+	g.toolCallsMu.Unlock()
 	result.MaxDepth = g.getMaxDepth()
 	result.Success = result.FinalAnswer != ""
 
