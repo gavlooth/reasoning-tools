@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -174,10 +175,26 @@ func LoadConfig() *Config {
 	return cfg
 }
 
-// Global config instance
-var globalConfig = LoadConfig()
+// Global config instance (initialized lazily)
+var (
+	globalConfig *Config
+	configOnce   sync.Once
+)
 
-// GetConfig returns the global configuration
+// GetConfig returns the global configuration, initializing it lazily on first access.
+// This allows tests to set environment variables before the first call to GetConfig(),
+// resolving the initialization order dependency issue.
 func GetConfig() *Config {
+	configOnce.Do(func() {
+		globalConfig = LoadConfig()
+	})
 	return globalConfig
+}
+
+// ResetConfig resets the global configuration for testing purposes.
+// This allows tests to set different environment variables and reload configuration.
+// NOTE: This function is not thread-safe and should only be used in tests.
+func ResetConfig() {
+	globalConfig = nil
+	configOnce = sync.Once{}
 }

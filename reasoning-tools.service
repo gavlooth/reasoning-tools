@@ -1,0 +1,25 @@
+[Unit]
+Description=Reasoning Tools MCP Server (SSE)
+After=network.target
+
+[Service]
+Type=simple
+User=heefoo
+WorkingDirectory=/home/heefoo/reasoning-tools
+ExecStart=/home/heefoo/reasoning-tools/reasoning-tools -transport=sse -port=8080
+Restart=on-failure
+RestartSec=5
+
+# Enable streaming output channels (all can be enabled simultaneously)
+Environment=MCP_STDERR_STREAM=true
+Environment=MCP_LOGGING_STREAM=true
+Environment=MCP_PROGRESS_STREAM=true
+
+# Environment variables for LLM provider (uncomment and configure as needed)
+# Environment=LLM_PROVIDER=openai
+# Environment=OPENAI_API_KEY=your-key-here
+# Environment=ZAI_API_KEY=your-key-here
+# Environment=GROQ_API_KEY=your-key-here
+
+[Install]
+WantedBy=multi-user.target

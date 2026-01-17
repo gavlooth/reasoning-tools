@@ -12,11 +12,11 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // Tool represents an executable tool available during reasoning
@@ -68,9 +68,16 @@ func NewToolRegistry() *ToolRegistry {
 	registry.Register(&WebFetchTool{})
 	registry.Register(&StringTool{})
 
-	// Enable all by default
+	// Enable tools by default, EXCEPT code_exec which requires explicit opt-in
+	// due to security implications
 	for name := range registry.tools {
-		registry.enabled[name] = true
+		if name == "code_exec" {
+			// code_exec is disabled by default for security reasons
+			// users must explicitly enable it
+			registry.enabled[name] = false
+		} else {
+			registry.enabled[name] = true
+		}
 	}
 
 	return registry
@@ -92,14 +99,22 @@ func (r *ToolRegistry) Disable(name string) {
 }
 
 // SetEnabled sets which tools are enabled
+// Note: code_exec requires explicit opt-in via CODE_EXEC_ENABLED environment variable
+// for security reasons and cannot be enabled through this method alone.
 func (r *ToolRegistry) SetEnabled(names []string) {
 	// Disable all first
 	for name := range r.enabled {
 		r.enabled[name] = false
 	}
-	// Enable specified
+	// Enable specified tools (except code_exec which requires env var)
 	for _, name := range names {
 		if _, exists := r.tools[name]; exists {
+			// code_exec requires explicit environment variable opt-in
+			if name == "code_exec" {
+				if os.Getenv("CODE_EXEC_ENABLED") != "true" && os.Getenv("CODE_EXEC_ENABLED") != "1" {
+					continue // Skip enabling code_exec without explicit opt-in
+				}
+			}
 			r.enabled[name] = true
 		}
 	}
@@ -229,14 +244,32 @@ func (t *CalculatorTool) Execute(ctx context.Context, input string) (string, err
 
 	result, err := evaluateMathExpr(input)
 	if err != nil {
-		return "", fmt.Errorf("calculation error: %w", err)
+		return "", fmt.Errorf("calculation error for expression %q: %w", input, err)
 	}
 
 	// Format result nicely
 	if result == float64(int64(result)) {
 		return fmt.Sprintf("%.0f", result), nil
 	}
-	return fmt.Sprintf("%.10g", result), nil
+
+	// Use threshold-based formatting for non-integer results
+	// to avoid scientific notation for values like 1e-5 or 1e10
+	absResult := math.Abs(result)
+	if absResult < 0.00001 && absResult > 0 {
+		// Very small numbers: use high precision fixed-point (e.g., 1e-5 -> 0.00001)
+		return strconv.FormatFloat(result, 'f', 10, 64), nil
+	}
+	if absResult >= 10000 {
+		// Large numbers: also use fixed-point (e.g., 1e10 -> 10000000000)
+		return strconv.FormatFloat(result, 'f', 0, 64), nil
+	}
+	// For numbers in the "sweet spot" (0.00001 to 10000), use fixed-point with reasonable precision
+	// Precision of 10 should cover most cases while removing trailing zeros
+	formatted := strconv.FormatFloat(result, 'f', 10, 64)
+	// Remove trailing zeros after decimal point
+	formatted = strings.TrimRight(formatted, "0")
+	formatted = strings.TrimRight(formatted, ".")
+	return formatted, nil
 }
 
 // evaluateMathExpr evaluates a mathematical expression safely
@@ -246,8 +279,10 @@ func evaluateMathExpr(expr string) (float64, error) {
 	expr = strings.ReplaceAll(expr, " ", "")
 
 	// Replace constants
+	// For "pi" we can use simple replacement since it's unlikely to conflict
 	expr = strings.ReplaceAll(expr, "pi", fmt.Sprintf("%.15f", math.Pi))
-	expr = strings.ReplaceAll(expr, "e", fmt.Sprintf("%.15f", math.E))
+	// For "e" we need to be careful NOT to replace it when part of scientific notation (e.g., 1e10)
+	expr = replaceConstant(expr, "e", fmt.Sprintf("%.15f", math.E))
 
 	// Replace ^ with ** for power (we'll handle it)
 	// First handle functions
@@ -290,6 +325,21 @@ func replaceFunctions(expr string) string {
 	}
 
 	return expr
+}
+
+// replaceConstant replaces a mathematical constant (like "e" or "pi") with its value,
+// but only when it's not part of a larger identifier or scientific notation.
+// For example, in "1e10", the "e" should NOT be replaced.
+func replaceConstant(expr, constant, value string) string {
+	// Pattern matches the constant only when:
+	// - It's preceded by start of string or a non-alphanumeric character
+	// - It's followed by end of string or a non-alphanumeric, non-digit character
+	// This prevents matching "e" inside "1e10" or "e" as part of a variable name
+	pattern := `(^|[^a-zA-Z0-9])` + regexp.QuoteMeta(constant) + `($|[^a-zA-Z0-9])`
+	re := regexp.MustCompile(pattern)
+
+	// Replace while preserving the surrounding characters
+	return re.ReplaceAllString(expr, `$1`+value+`$2`)
 }
 
 func parseExpr(expr string) (float64, error) {
@@ -397,7 +447,7 @@ func (t *CodeExecutorTool) Name() string {
 }
 
 func (t *CodeExecutorTool) Description() string {
-	return "Execute Python code and return the output. Input: Python code snippet. The code runs in a sandboxed environment with a 10s timeout. Print results to see them."
+	return "Execute Python code and return the output. Input: Python code snippet. WARNING: This tool executes code on the host system without full sandboxing. Only use in trusted environments. The code runs with a 10s timeout and basic restrictions. Print results to see them."
 }
 
 func (t *CodeExecutorTool) Execute(ctx context.Context, input string) (string, error) {
@@ -406,15 +456,27 @@ func (t *CodeExecutorTool) Execute(ctx context.Context, input string) (string, e
 		return "", fmt.Errorf("empty code")
 	}
 
+	// Security: Validate input against dangerous patterns
+	if err := validatePythonCode(input); err != nil {
+		return "", fmt.Errorf("code validation failed: %w", err)
+	}
+
+	// Get configurable timeout from global config
+	config := GetConfig()
+
 	// Create a context with timeout
-	execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	execCtx, cancel := context.WithTimeout(ctx, config.CodeExecTimeout)
 	defer cancel()
 
-	// Try Python first, then Python3
+	// Try Python3 first, then Python (Python 3 is the modern standard)
 	pythonCmd := "python3"
 	if _, err := exec.LookPath("python3"); err != nil {
 		pythonCmd = "python"
 	}
+
+	// Audit log: log code execution for security tracking
+	// Log to stderr so it's visible but doesn't interfere with stdout capture
+	fmt.Fprintf(os.Stderr, "[AUDIT] code_exec: executing Python code (%d chars)\n", len(input))
 
 	cmd := exec.CommandContext(execCtx, pythonCmd, "-c", input)
 
@@ -434,7 +496,7 @@ func (t *CodeExecutorTool) Execute(ctx context.Context, input string) (string, e
 
 	if err != nil {
 		if execCtx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("execution timed out (10s limit)")
+			return "", fmt.Errorf("execution timed out (%v limit)", config.CodeExecTimeout)
 		}
 		if output == "" {
 			return "", fmt.Errorf("execution failed: %w", err)
@@ -471,7 +533,8 @@ func (t *WebFetchTool) Execute(ctx context.Context, input string) (string, error
 	}
 
 	if t.client == nil {
-		t.client = &http.Client{Timeout: 15 * time.Second}
+		config := GetConfig()
+		t.client = &http.Client{Timeout: config.WebFetchTimeout}
 	}
 
 	// Check if it's a search query
@@ -666,6 +729,9 @@ func (t *StringTool) Execute(ctx context.Context, input string) (string, error) 
 		if len(subparts) != 2 {
 			return "", fmt.Errorf("split requires: delimiter,text")
 		}
+		if subparts[0] == "" {
+			return "", fmt.Errorf("split delimiter cannot be empty (use 'chars' operation for character-by-character split)")
+		}
 		result := strings.Split(subparts[1], subparts[0])
 		return fmt.Sprintf("%v", result), nil
 
@@ -757,6 +823,9 @@ func evalBinary(left, right interface{}, op token.Token) (interface{}, error) {
 		}
 		return lf / rf, nil
 	case token.REM:
+		if rf == 0 {
+			return nil, fmt.Errorf("division by zero")
+		}
 		return math.Mod(lf, rf), nil
 	}
 	return nil, fmt.Errorf("unsupported operator: %s", op)
@@ -773,4 +842,348 @@ func toFloat64(v interface{}) float64 {
 	default:
 		return 0
 	}
+}
+
+// validatePythonCode checks for dangerous patterns in Python code before execution
+// This function uses a multi-layered approach:
+// 1. Fast string-based pattern matching for obvious threats
+// 2. AST-based analysis for deeper structural validation
+func validatePythonCode(code string) error {
+	// Normalize code for checking
+	lowerCode := strings.ToLower(code)
+
+	// Blocklist of dangerous patterns
+	dangerousPatterns := []struct {
+		pattern string
+		reason  string
+	}{
+		{"import os", "operating system access"},
+		{"import subprocess", "process execution"},
+		{"import sys", "system module access"},
+		{"import shutil", "file operations"},
+		{"import pathlib", "file system access"},
+		{"import socket", "network access"},
+		{"import urllib", "network requests"},
+		{"import requests", "network requests"},
+		{"import http", "network requests"},
+		{"import ftplib", "network access"},
+		{"import multiprocessing", "process execution"},
+		{"import threading", "concurrency that may bypass timeouts"},
+		{"import signal", "signal handling that may affect process control"},
+		{"import fcntl", "file descriptor manipulation"},
+		{"import resource", "system resource manipulation"},
+		{"import pty", "pseudo-terminal operations"},
+		{"import tty", "terminal control"},
+		{"from os", "operating system access"},
+		{"from subprocess", "process execution"},
+		{"from sys", "system module access"},
+		{"from shutil", "file operations"},
+		{"from pathlib", "file system access"},
+		{"from socket", "network access"},
+		{"from urllib", "network requests"},
+		{"from requests", "network requests"},
+		{"from http", "network requests"},
+		{"from multiprocessing", "process execution"},
+		{"from threading", "concurrency"},
+		{"from signal", "signal handling"},
+		{"open(", "file operations"},
+		{"__import__", "dynamic imports"},
+		{"eval(", "code execution"},
+		{"exec(", "code execution"},
+		{"compile(", "code compilation"},
+		{"globals()", "access to globals"},
+		{"locals()", "access to locals"},
+		{"vars(", "access to variables"},
+		{"getattr(", "attribute access"},
+		{"setattr(", "attribute modification"},
+		{"delattr(", "attribute deletion"},
+		{"__class__", "class manipulation"},
+		{"__base__", "class manipulation"},
+		{"__subclasses__", "class manipulation"},
+		{"__mro__", "method resolution order"},
+		{"__code__", "code object access"},
+		{"__closure__", "closure access"},
+		{"__globals__", "global access"},
+		{"__dict__", "object attribute manipulation"},
+		{"__getattribute__", "attribute access interception"},
+		{"__setattribute__", "attribute modification interception"},
+		{"__enter__", "context manager entry"},
+		{"__exit__", "context manager exit"},
+	}
+
+	// Check each dangerous pattern
+	for _, dp := range dangerousPatterns {
+		if strings.Contains(lowerCode, dp.pattern) {
+			return fmt.Errorf("code contains blocked pattern '%s': %s", dp.pattern, dp.reason)
+		}
+	}
+
+	// Check for character escapes that might bypass filters
+	if strings.Contains(code, "\\x") || strings.Contains(code, "\\u") || strings.Contains(code, "\\U") {
+		return fmt.Errorf("code contains escape sequences that may bypass security filters")
+	}
+
+	// Check for base64 or encoded content that might be malicious
+	if strings.Contains(lowerCode, "base64") || strings.Contains(lowerCode, "b64decode") {
+		return fmt.Errorf("code contains base64 operations which may indicate malicious intent")
+	}
+
+	// Check for pickle or marshal (code serialization)
+	if strings.Contains(lowerCode, "pickle") || strings.Contains(lowerCode, "marshal") || strings.Contains(lowerCode, "yaml") || strings.Contains(lowerCode, "shelve") {
+		return fmt.Errorf("code contains serialization operations which can execute arbitrary code")
+	}
+
+	// Check for type and object manipulation
+	if strings.Contains(lowerCode, "type(") || strings.Contains(lowerCode, "object(") {
+		return fmt.Errorf("code contains type/object manipulation which may bypass security")
+	}
+
+	// Check for super() which can be used to access parent class methods
+	if strings.Contains(lowerCode, "super(") {
+		return fmt.Errorf("code contains super() which may be used for class manipulation")
+	}
+
+	// Additional bypass technique checks
+	// Check for list comprehension or generator expressions with dangerous patterns
+	if strings.Contains(lowerCode, "[__import__") || strings.Contains(lowerCode, "(__import__") {
+		return fmt.Errorf("code contains obfuscated import patterns")
+	}
+
+	// Check for lambda with potentially dangerous operations
+	if strings.Contains(lowerCode, "lambda __import__") || strings.Contains(lowerCode, "lambda exec") || strings.Contains(lowerCode, "lambda eval") {
+		return fmt.Errorf("code contains lambda with dangerous functions")
+	}
+
+	// Check for string concatenation that might form dangerous function names
+	// This is a basic heuristic; more sophisticated detection would be needed
+	if strings.Contains(code, "+") && (strings.Contains(lowerCode, "exec") || strings.Contains(lowerCode, "eval")) {
+		// Look for patterns like "ex" + "ec" that might bypass string matching
+		if strings.Count(code, "\"+") > 2 || strings.Count(code, "'+") > 2 {
+			return fmt.Errorf("code contains suspicious string concatenation patterns")
+		}
+	}
+
+	// Check for bytearray or bytes operations that might encode malicious code
+	if strings.Contains(lowerCode, "bytearray") || strings.Contains(lowerCode, "bytes.fromhex") || strings.Contains(lowerCode, "bytes.decode") {
+		return fmt.Errorf("code contains byte operations that may encode malicious code")
+	}
+
+	// Check for format strings that might be used for obfuscation
+	if strings.Contains(lowerCode, ".format(") && strings.Contains(code, "{") {
+		// This is a heuristic - format strings can be legitimate
+		// Check for suspicious format patterns
+		if strings.Count(code, "{") > 10 {
+			return fmt.Errorf("code contains excessive format string usage which may indicate obfuscation")
+		}
+	}
+
+	// AST-based validation using Python's ast module
+	// This provides deeper analysis of code structure
+	config := GetConfig()
+
+	// Try Python3 first, then Python (Python 3 is the modern standard)
+	pythonCmd := "python3"
+	if _, err := exec.LookPath("python3"); err != nil {
+		pythonCmd = "python"
+	}
+
+	// Create a Python script to analyze the AST
+	astAnalysisScript := `
+import ast
+import sys
+import json
+
+def analyze_code(code):
+    try:
+        tree = ast.parse(code)
+        analyzer = ASTSecurityAnalyzer()
+        analyzer.visit(tree)
+        if analyzer.violations:
+            return json.dumps({"status": "error", "violations": analyzer.violations})
+        return json.dumps({"status": "ok"})
+    except SyntaxError as e:
+        return json.dumps({"status": "syntax_error", "message": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+class ASTSecurityAnalyzer(ast.NodeVisitor):
+    def __init__(self):
+        self.violations = []
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            module_name = alias.name.split('.')[0]
+            if module_name in ['os', 'subprocess', 'sys', 'shutil', 'pathlib', 'socket',
+                              'urllib', 'requests', 'http', 'ftplib', 'multiprocessing',
+                              'threading', 'signal', 'fcntl', 'resource', 'pty', 'tty',
+                              'ctypes', 'mmap', 'tempfile', 'io', 'importlib']:
+                self.violations.append(f"import of blocked module: {module_name}")
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        if node.module:
+            module_name = node.module.split('.')[0]
+            if module_name in ['os', 'subprocess', 'sys', 'shutil', 'pathlib', 'socket',
+                              'urllib', 'requests', 'http', 'ftplib', 'multiprocessing',
+                              'threading', 'signal', 'fcntl', 'resource', 'pty', 'tty',
+                              'ctypes', 'mmap', 'tempfile', 'io', 'importlib']:
+                self.violations.append(f"from import of blocked module: {module_name}")
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        # Check for dangerous function calls
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name in ['eval', 'exec', 'compile', '__import__', 'open', 'globals',
+                            'locals', 'vars', 'getattr', 'setattr', 'delattr', 'help',
+                            'dir', 'type', 'super', 'hasattr', 'isinstance', 'issubclass']:
+                self.violations.append(f"call to blocked function: {func_name}")
+        elif isinstance(node.func, ast.Attribute):
+            # Check for dangerous attribute access
+            if node.func.attr in ['__class__', '__base__', '__bases__', '__subclasses__',
+                                  '__mro__', '__code__', '__closure__', '__globals__', '__dict__',
+                                  '__getattribute__', '__setattr__', '__delattr__']:
+                self.violations.append(f"access to blocked attribute: {node.func.attr}")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):
+        # Check for access to dangerous dunder methods
+        if node.attr in ['__class__', '__base__', '__bases__', '__subclasses__',
+                        '__mro__', '__code__', '__closure__', '__globals__', '__dict__',
+                        '__getattribute__', '__setattr__', '__delattr__', '__import__']:
+            self.violations.append(f"access to blocked attribute: {node.attr}")
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        # Check for decorators that might bypass security
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Name) and decorator.id in ['staticmethod', 'classmethod', 'property']:
+                # These are generally safe
+                pass
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node):
+        # Check for metaclass usage which can bypass restrictions
+        for keyword in node.keywords:
+            if keyword.arg == 'metaclass':
+                self.violations.append("metaclass usage detected")
+        self.generic_visit(node)
+
+    def visit_Lambda(self, node):
+        # Check for dangerous operations in lambda
+        self.generic_visit(node)
+
+    def visit_ListComp(self, node):
+        # Check for dangerous operations in list comprehensions
+        self.generic_visit(node)
+
+    def visit_DictComp(self, node):
+        # Check for dangerous operations in dict comprehensions
+        self.generic_visit(node)
+
+    def visit_SetComp(self, node):
+        # Check for dangerous operations in set comprehensions
+        self.generic_visit(node)
+
+    def visit_GeneratorExp(self, node):
+        # Check for dangerous operations in generator expressions
+        self.generic_visit(node)
+
+    def visit_Starred(self, node):
+        # Check for starred expressions which might be used for obfuscation
+        self.generic_visit(node)
+
+    def visit_IfExp(self, node):
+        # Check for conditional expressions
+        self.generic_visit(node)
+
+    def visit_JoinedStr(self, node):
+        # Check for f-strings which might contain dangerous code
+        self.generic_visit(node)
+
+    def visit_FormattedValue(self, node):
+        # Check for formatted values in f-strings
+        self.generic_visit(node)
+
+    def visit_Try(self, node):
+        # Check for try-except blocks that might hide malicious behavior
+        self.generic_visit(node)
+
+    def visit_While(self, node):
+        # Check for while loops which might be used for infinite loops
+        self.generic_visit(node)
+
+    def visit_For(self, node):
+        # Check for for loops
+        self.generic_visit(node)
+
+    def visit_With(self, node):
+        # Check for context managers
+        for item in node.items:
+            if isinstance(item.context_expr, ast.Call):
+                if isinstance(item.context_expr.func, ast.Name):
+                    if item.context_expr.func.id == 'open':
+                        self.violations.append("file operation using 'with open()'")
+        self.generic_visit(node)
+
+if __name__ == "__main__":
+    code = sys.stdin.read()
+    print(analyze_code(code))
+`
+
+	// Create context with timeout for AST analysis
+	astCtx, astCancel := context.WithTimeout(context.Background(), config.CodeExecTimeout)
+	defer astCancel()
+
+	// Run Python AST analysis
+	cmd := exec.CommandContext(astCtx, pythonCmd, "-c", astAnalysisScript)
+
+	// Write the code to stdin with proper synchronization to avoid goroutine leak
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil
+	}
+
+	// Use a channel to track when the write completes
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		defer stdin.Close()
+		stdin.Write([]byte(code))
+	}()
+
+	// Wait for command to complete
+	output, err := cmd.CombinedOutput()
+
+	// Wait for the write goroutine to complete to avoid goroutine leak
+	<-writeDone
+	if err != nil {
+		// If AST analysis fails (e.g., Python not available), log a warning but don't block
+		// This maintains backward compatibility while adding security when possible
+		fmt.Fprintf(os.Stderr, "[WARN] AST validation unavailable, using pattern matching only: %v\n", err)
+		return nil
+	}
+
+	// Parse the JSON result from AST analysis
+	var astResult struct {
+		Status     string   `json:"status"`
+		Violations []string `json:"violations"`
+		Message    string   `json:"message"`
+	}
+
+	if err := json.Unmarshal(output, &astResult); err != nil {
+		// If we can't parse the result, log but don't block
+		fmt.Fprintf(os.Stderr, "[WARN] Could not parse AST validation result: %v\n", err)
+		return nil
+	}
+
+	if astResult.Status == "error" && len(astResult.Violations) > 0 {
+		return fmt.Errorf("AST validation failed: %s", strings.Join(astResult.Violations, "; "))
+	}
+
+	if astResult.Status == "syntax_error" {
+		return fmt.Errorf("syntax error in code: %s", astResult.Message)
+	}
+
+	return nil
 }

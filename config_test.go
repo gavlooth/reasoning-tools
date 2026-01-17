@@ -237,6 +237,36 @@ func TestGetConfig(t *testing.T) {
 	}
 }
 
+// TestGetConfigLazyInitialization tests that GetConfig uses lazy initialization,
+// allowing environment variables to be set before the first call
+func TestGetConfigLazyInitialization(t *testing.T) {
+	// Reset config to ensure clean state
+	ResetConfig()
+
+	// Set environment variable before first GetConfig call
+	os.Setenv("OPENAI_TIMEOUT", "75")
+	defer os.Unsetenv("OPENAI_TIMEOUT")
+
+	cfg := GetConfig()
+
+	// Should load the environment variable set before the call
+	if cfg.OpenAITimeout != 75*time.Second {
+		t.Errorf("Expected OpenAITimeout to be 75s (from env var set before GetConfig), got %v", cfg.OpenAITimeout)
+	}
+}
+
+// TestGetConfigSingleton tests that GetConfig returns the same instance on multiple calls
+func TestGetConfigSingleton(t *testing.T) {
+	ResetConfig()
+
+	cfg1 := GetConfig()
+	cfg2 := GetConfig()
+
+	if cfg1 != cfg2 {
+		t.Error("GetConfig should return the same instance (singleton pattern)")
+	}
+}
+
 func TestConfigValidate_ValidConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	if err := cfg.Validate(); err != nil {

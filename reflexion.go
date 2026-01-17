@@ -12,39 +12,57 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"reasoning-tools/utils"
 )
 
 // Reflexion implements episodic memory and learning from failures
 type Reflexion struct {
-	provider   Provider
-	config     ReflexionConfig
-	memory     *EpisodicMemory
-	tools      *ToolRegistry
-	toolCalls  int
-	onProgress func(ProgressUpdate)
+	provider      Provider
+	config        ReflexionConfig
+	memory        *EpisodicMemory
+	tools         *ToolRegistry
+	toolCalls     int
+	onProgress    func(ProgressUpdate)
+	onToken       func(token string)
+	enableStreams bool
+}
+
+// SetTokenCallback sets a callback for token streaming
+func (r *Reflexion) SetTokenCallback(cb func(token string)) {
+	r.onToken = cb
+}
+
+// SetEnableStreaming enables or disables LLM streaming
+func (r *Reflexion) SetEnableStreaming(enable bool) {
+	r.enableStreams = enable
 }
 
 // ReflexionConfig configures the reflexion process
 type ReflexionConfig struct {
-	MaxAttempts           int      // Maximum reasoning attempts before giving up (default: 3)
-	MaxThoughtsPerAttempt int      // Max thoughts per attempt (default: 10)
-	MemoryPath            string   // Path to store episodic memory (default: ~/.local/share/reasoning-tools/memory.json)
-	LearnFromPast         bool     // Whether to query past failures (default: true)
-	Temperature           float64  // LLM temperature (default: 0.7)
-	EnableTools           bool     // Enable tool usage during reasoning
-	MaxToolCalls          int      // Maximum tool calls per attempt (default: 5)
-	EnabledTools          []string // Which tools to enable (empty = all)
+	MaxAttempts           int         // Maximum reasoning attempts before giving up (default: 3)
+	MaxThoughtsPerAttempt int         // Max thoughts per attempt (default: 10)
+	MemoryPath            string      // Path to store episodic memory (default: ~/.local/share/reasoning-tools/memory.json)
+	LearnFromPast         bool        // Whether to query past failures (default: true)
+	Temperature           float64     // LLM temperature (default: 0.7)
+	EnableTools           bool        // Enable tool usage during reasoning
+	MaxToolCalls          int         // Maximum tool calls per attempt (default: 5)
+	EnabledTools          []string    // Which tools to enable (empty = all)
+	MaxEpisodes           int         // Maximum episodes to keep in memory (default: 100, 0 = unlimited)
+	EpisodeTTL            time.Duration // Time-to-live for episodes (default: 0 = no expiration)
 }
 
 // DefaultReflexionConfig returns sensible defaults
 func DefaultReflexionConfig() ReflexionConfig {
 	homeDir, _ := os.UserHomeDir()
 	return ReflexionConfig{
-		MaxAttempts:          3,
+		MaxAttempts:           3,
 		MaxThoughtsPerAttempt: 10,
-		MemoryPath:           filepath.Join(homeDir, ".local", "share", "reasoning-tools", "memory.json"),
-		LearnFromPast:        true,
-		Temperature:          0.7,
+		MemoryPath:            filepath.Join(homeDir, ".local", "share", "reasoning-tools", "memory.json"),
+		LearnFromPast:         true,
+		Temperature:           0.7,
+		MaxEpisodes:           100,             // Keep up to 100 episodes
+		EpisodeTTL:            0,               // No TTL by default (episodes kept indefinitely until max limit)
 	}
 }
 
@@ -57,17 +75,17 @@ type EpisodicMemory struct {
 
 // Episode represents a single reasoning attempt
 type Episode struct {
-	ID           string    `json:"id"`
-	Problem      string    `json:"problem"`
-	ProblemHash  string    `json:"problem_hash"` // For similarity matching
-	Attempt      int       `json:"attempt"`
-	Thoughts     []string  `json:"thoughts"`
-	FinalAnswer  string    `json:"final_answer"`
-	WasSuccessful bool     `json:"was_successful"`
-	FailureReason string   `json:"failure_reason,omitempty"`
-	Reflection   string    `json:"reflection,omitempty"` // What went wrong / what to try differently
-	Timestamp    time.Time `json:"timestamp"`
-	Provider     string    `json:"provider"`
+	ID            string    `json:"id"`
+	Problem       string    `json:"problem"`
+	ProblemHash   string    `json:"problem_hash"` // For similarity matching
+	Attempt       int       `json:"attempt"`
+	Thoughts      []string  `json:"thoughts"`
+	FinalAnswer   string    `json:"final_answer"`
+	WasSuccessful bool      `json:"was_successful"`
+	FailureReason string    `json:"failure_reason,omitempty"`
+	Reflection    string    `json:"reflection,omitempty"` // What went wrong / what to try differently
+	Timestamp     time.Time `json:"timestamp"`
+	Provider      string    `json:"provider"`
 }
 
 // ReflexionResult represents the complete result of reflexion reasoning
@@ -232,7 +250,7 @@ func (r *Reflexion) Reason(ctx context.Context, problem string) (*ReflexionResul
 
 		r.emitProgress(ProgressUpdate{
 			Type:    "thought",
-			Message: fmt.Sprintf("Reflection: %s", truncateStr(reflection, 100)),
+			Message: fmt.Sprintf("Reflection: %s", utils.TruncateStr(reflection, 100)),
 		})
 
 		// Store failed episode
@@ -331,18 +349,39 @@ For each step, output a JSON object:
 	}
 	attemptToolCalls := 0
 
+	// Check if provider supports streaming
+	streamingProvider, canStream := r.provider.(StreamingProvider)
+	useStreaming := canStream && r.enableStreams && streamingProvider.SupportsStreaming()
+
 	for i := 0; i < r.config.MaxThoughtsPerAttempt; i++ {
-		response, err := r.provider.Chat(ctx, messages, ChatOptions{
-			Temperature: r.config.Temperature,
-			MaxTokens:   1024,
-		})
+		var response string
+		var err error
+
+		if useStreaming {
+			response, err = streamingProvider.ChatStream(ctx, messages, ChatOptions{
+				Temperature: r.config.Temperature,
+				MaxTokens:   1024,
+			}, func(token string) {
+				if r.onToken != nil {
+					r.onToken(token)
+				}
+			})
+		} else {
+			response, err = r.provider.Chat(ctx, messages, ChatOptions{
+				Temperature: r.config.Temperature,
+				MaxTokens:   1024,
+			})
+		}
 		if err != nil {
 			return thoughts, "", toolResults, fmt.Errorf("reasoning failed at step %d: %w", i+1, err)
 		}
 
 		// Parse the response
-		jsonStr := extractJSON(response)
+		jsonStr := utils.ExtractJSON(response)
 		if jsonStr == "" {
+			// Log JSON parsing failure for observability
+			fmt.Fprintf(os.Stderr, "[WARNING] reflexion: failed to extract JSON at step %d (attempt %d), falling back to plain text. Response preview: %s\n",
+				i+1, attemptNum, utils.TruncateStr(response, 100))
 			// Try to extract thought anyway
 			thoughts = append(thoughts, response)
 			messages = append(messages, ChatMessage{Role: "assistant", Content: response})
@@ -395,7 +434,7 @@ For each step, output a JSON object:
 			r.emitProgress(ProgressUpdate{
 				Type:    "thought",
 				NodeID:  fmt.Sprintf("t%d", i+1),
-				Thought: truncateStr(step.Thought, 100),
+				Thought: utils.TruncateStr(step.Thought, 100),
 				Depth:   i + 1,
 			})
 
@@ -412,15 +451,28 @@ For each step, output a JSON object:
 	finalPrompt := "You've reached the maximum number of reasoning steps. Please provide your final answer now as a JSON object with is_final: true."
 	messages = append(messages, ChatMessage{Role: "user", Content: finalPrompt})
 
-	response, err := r.provider.Chat(ctx, messages, ChatOptions{
-		Temperature: r.config.Temperature,
-		MaxTokens:   512,
-	})
+	var response string
+	var err error
+	if useStreaming {
+		response, err = streamingProvider.ChatStream(ctx, messages, ChatOptions{
+			Temperature: r.config.Temperature,
+			MaxTokens:   512,
+		}, func(token string) {
+			if r.onToken != nil {
+				r.onToken(token)
+			}
+		})
+	} else {
+		response, err = r.provider.Chat(ctx, messages, ChatOptions{
+			Temperature: r.config.Temperature,
+			MaxTokens:   512,
+		})
+	}
 	if err != nil {
 		return thoughts, "", toolResults, err
 	}
 
-	jsonStr := extractJSON(response)
+	jsonStr := utils.ExtractJSON(response)
 	if jsonStr != "" {
 		var step struct {
 			Answer string `json:"answer"`
@@ -430,15 +482,17 @@ For each step, output a JSON object:
 		}
 	}
 
-	// Fallback: use the response as the answer
+	// Fallback: use the response as the answer (with logging for observability)
+	fmt.Fprintf(os.Stderr, "[WARNING] reflexion: failed to extract final answer JSON at end of reasoning, using plain text fallback. Response preview: %s\n",
+		utils.TruncateStr(response, 100))
 	return thoughts, strings.TrimSpace(response), toolResults, nil
 }
 
 // evaluateAnswer evaluates if the answer is correct/satisfactory
 func (r *Reflexion) evaluateAnswer(ctx context.Context, problem string, thoughts []string, answer string) (string, bool, error) {
-	thoughtsStr := ""
+	var thoughtsStr strings.Builder
 	for i, t := range thoughts {
-		thoughtsStr += fmt.Sprintf("%d. %s\n", i+1, t)
+		thoughtsStr.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
 	}
 
 	prompt := fmt.Sprintf(`Evaluate this reasoning and answer for the given problem.
@@ -460,23 +514,41 @@ Respond with ONLY a JSON object:
   "evaluation": "<brief evaluation of the reasoning and answer>",
   "is_correct": <true if the answer is correct and well-reasoned, false otherwise>,
   "issues": ["<list of any issues found>"]
-}`, problem, thoughtsStr, answer)
+}`, problem, thoughtsStr.String(), answer)
 
 	messages := []ChatMessage{
 		{Role: "system", Content: "You are a strict evaluator. Check reasoning carefully for errors."},
 		{Role: "user", Content: prompt},
 	}
 
-	response, err := r.provider.Chat(ctx, messages, ChatOptions{
-		Temperature: 0.3,
-		MaxTokens:   512,
-	})
+	var response string
+	var err error
+
+	// Check if provider supports streaming
+	if sp, ok := r.provider.(StreamingProvider); ok && r.enableStreams && sp.SupportsStreaming() {
+		response, err = sp.ChatStream(ctx, messages, ChatOptions{
+			Temperature: 0.3,
+			MaxTokens:   512,
+		}, func(token string) {
+			if r.onToken != nil {
+				r.onToken(token)
+			}
+		})
+	} else {
+		response, err = r.provider.Chat(ctx, messages, ChatOptions{
+			Temperature: 0.3,
+			MaxTokens:   512,
+		})
+	}
 	if err != nil {
 		return "", false, err
 	}
 
-	jsonStr := extractJSON(response)
+	jsonStr := utils.ExtractJSON(response)
 	if jsonStr == "" {
+		// Log JSON parsing failure for observability
+		fmt.Fprintf(os.Stderr, "[WARNING] reflexion: failed to extract JSON in evaluateAnswer, falling back to plain text. Response preview: %s\n",
+			utils.TruncateStr(response, 100))
 		return response, false, nil
 	}
 
@@ -500,9 +572,9 @@ Respond with ONLY a JSON object:
 
 // generateReflection generates a reflection on what went wrong
 func (r *Reflexion) generateReflection(ctx context.Context, problem string, thoughts []string, answer, evaluation string) (string, error) {
-	thoughtsStr := ""
+	var thoughtsStr strings.Builder
 	for i, t := range thoughts {
-		thoughtsStr += fmt.Sprintf("%d. %s\n", i+1, t)
+		thoughtsStr.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
 	}
 
 	prompt := fmt.Sprintf(`The following reasoning attempt was not successful. Generate a reflection to improve the next attempt.
@@ -521,17 +593,32 @@ Generate a brief, actionable reflection:
 2. What should be done differently next time?
 3. What key insight was missed?
 
-Respond with just the reflection text, no JSON.`, problem, thoughtsStr, answer, evaluation)
+Respond with just the reflection text, no JSON.`, problem, thoughtsStr.String(), answer, evaluation)
 
 	messages := []ChatMessage{
 		{Role: "system", Content: "You are a thoughtful analyst. Generate concise, actionable reflections on reasoning failures."},
 		{Role: "user", Content: prompt},
 	}
 
-	response, err := r.provider.Chat(ctx, messages, ChatOptions{
-		Temperature: 0.5,
-		MaxTokens:   512,
-	})
+	var response string
+	var err error
+
+	// Check if provider supports streaming
+	if sp, ok := r.provider.(StreamingProvider); ok && r.enableStreams && sp.SupportsStreaming() {
+		response, err = sp.ChatStream(ctx, messages, ChatOptions{
+			Temperature: 0.5,
+			MaxTokens:   512,
+		}, func(token string) {
+			if r.onToken != nil {
+				r.onToken(token)
+			}
+		})
+	} else {
+		response, err = r.provider.Chat(ctx, messages, ChatOptions{
+			Temperature: 0.5,
+			MaxTokens:   512,
+		})
+	}
 	if err != nil {
 		return "", err
 	}
@@ -604,10 +691,8 @@ func (r *Reflexion) storeEpisode(problem string, attempt int, thoughts []string,
 
 	r.memory.Episodes = append(r.memory.Episodes, episode)
 
-	// Keep only last 100 episodes
-	if len(r.memory.Episodes) > 100 {
-		r.memory.Episodes = r.memory.Episodes[len(r.memory.Episodes)-100:]
-	}
+	// Apply memory limits based on configuration
+	r.memory.cleanup(r.config.MaxEpisodes, r.config.EpisodeTTL)
 
 	// Save to disk
 	r.memory.save()
@@ -622,17 +707,34 @@ func loadOrCreateMemory(path string) *EpisodicMemory {
 
 	// Ensure directory exists
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		// Log the error but continue with in-memory storage
+		// The memory will still work, just won't persist to disk
+		fmt.Fprintf(os.Stderr, "Warning: failed to create memory directory %s: %v (memory will not persist)\n", dir, err)
+		// Store a flag to indicate persistence is disabled
+		memory.path = ""
 		return memory
 	}
 
 	// Try to load existing memory
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// File doesn't exist yet, that's okay
 		return memory
 	}
 
 	if err := json.Unmarshal(data, memory); err != nil {
+		// Invalid file - back up the corrupted file before starting fresh
+		// This prevents data loss if the file contains valuable information
+		backupPath := path + ".corrupted." + fmt.Sprintf("%d", time.Now().Unix())
+		if backupErr := os.WriteFile(backupPath, data, 0600); backupErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to parse memory file %s: %v (starting with empty memory)\n", path, err)
+			fmt.Fprintf(os.Stderr, "Warning: failed to create backup at %s: %v (original file may be overwritten on next save)\n", backupPath, backupErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: failed to parse memory file %s: %v (starting with empty memory)\n", path, err)
+			fmt.Fprintf(os.Stderr, "Info: corrupted file backed up to %s for potential recovery\n", backupPath)
+		}
+		// Return empty memory with path still set - the backup is safe
 		return memory
 	}
 
@@ -642,12 +744,45 @@ func loadOrCreateMemory(path string) *EpisodicMemory {
 
 // save persists the memory to disk
 func (m *EpisodicMemory) save() {
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
+	// If path is empty, persistence is disabled (directory creation failed)
+	if m.path == "" {
 		return
 	}
 
-	_ = os.WriteFile(m.path, data, 0644)
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to marshal memory data: %v\n", err)
+		return
+	}
+
+	if err := os.WriteFile(m.path, data, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save memory to %s: %v\n", m.path, err)
+	}
+}
+
+// cleanup removes old episodes based on max count and TTL
+// maxEpisodes: maximum number of episodes to keep (0 = unlimited)
+// ttl: time-to-live for episodes (0 = no expiration)
+func (m *EpisodicMemory) cleanup(maxEpisodes int, ttl time.Duration) {
+	now := time.Now()
+	var filtered []Episode
+
+	// First, filter by TTL if set
+	if ttl > 0 {
+		cutoff := now.Add(-ttl)
+		for _, ep := range m.Episodes {
+			if ep.Timestamp.After(cutoff) {
+				filtered = append(filtered, ep)
+			}
+		}
+		m.Episodes = filtered
+	}
+
+	// Then, enforce max count limit if set
+	if maxEpisodes > 0 && len(m.Episodes) > maxEpisodes {
+		// Keep the most recent episodes
+		m.Episodes = m.Episodes[len(m.Episodes)-maxEpisodes:]
+	}
 }
 
 // hashProblem creates a hash for similarity matching
@@ -713,7 +848,7 @@ func FormatReflexionResult(result *ReflexionResult) string {
 	if len(result.LessonsLearned) > 0 {
 		sb.WriteString("### Lessons from Past (Applied)\n\n")
 		for _, lesson := range result.LessonsLearned {
-			sb.WriteString(fmt.Sprintf("- %s\n", truncateStr(lesson, 100)))
+			sb.WriteString(fmt.Sprintf("- %s\n", utils.TruncateStr(lesson, 100)))
 		}
 		sb.WriteString("\n")
 	}
@@ -723,7 +858,7 @@ func FormatReflexionResult(result *ReflexionResult) string {
 
 		sb.WriteString("**Reasoning:**\n")
 		for i, thought := range attempt.Thoughts {
-			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, truncateStr(thought, 150)))
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, utils.TruncateStr(thought, 150)))
 		}
 		sb.WriteString("\n")
 
@@ -731,7 +866,7 @@ func FormatReflexionResult(result *ReflexionResult) string {
 		if len(attempt.ToolResults) > 0 {
 			sb.WriteString("**Tools Used:**\n")
 			for _, tr := range attempt.ToolResults {
-				sb.WriteString(fmt.Sprintf("- `%s(%s)` → %s\n", tr.Tool, truncateStr(tr.Input, 30), truncateStr(tr.Output, 50)))
+				sb.WriteString(fmt.Sprintf("- `%s(%s)` → %s\n", tr.Tool, utils.TruncateStr(tr.Input, 30), utils.TruncateStr(tr.Output, 50)))
 			}
 			sb.WriteString("\n")
 		}

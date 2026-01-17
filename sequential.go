@@ -4,11 +4,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"reasoning-tools/utils"
 )
 
 // SequentialClient performs simple linear sequential thinking
 type SequentialClient struct {
-	provider Provider
+	provider      Provider
+	onProgress    func(ProgressUpdate)
+	onToken       func(token string)
+	enableStreams bool
+}
+
+// SetProgressCallback sets a callback for progress updates
+func (c *SequentialClient) SetProgressCallback(cb func(ProgressUpdate)) {
+	c.onProgress = cb
+}
+
+// SetTokenCallback sets a callback for token streaming
+func (c *SequentialClient) SetTokenCallback(cb func(token string)) {
+	c.onToken = cb
+}
+
+// SetEnableStreaming enables or disables LLM streaming
+func (c *SequentialClient) SetEnableStreaming(enable bool) {
+	c.enableStreams = enable
+}
+
+func (c *SequentialClient) emitProgress(update ProgressUpdate) {
+	if c.onProgress != nil {
+		c.onProgress(update)
+	}
 }
 
 // ThinkingStep represents a single step in the thinking process
@@ -82,12 +108,39 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 		{Role: "user", Content: fmt.Sprintf("Problem to solve:\n\n%s\n\nBegin your sequential thinking process.", problem)},
 	}
 
+	// Check if provider supports streaming
+	streamingProvider, canStream := c.provider.(StreamingProvider)
+	useStreaming := canStream && c.enableStreams && streamingProvider.SupportsStreaming()
+
 	for i := 0; i < maxThoughts; i++ {
-		// Call LLM
-		response, err := c.provider.Chat(ctx, messages, ChatOptions{
-			Temperature: 0.7,
-			MaxTokens:   2048,
+		// Emit progress: generating thought
+		c.emitProgress(ProgressUpdate{
+			Type:    EventTypeProgress,
+			NodeID:  fmt.Sprintf("t%d", i+1),
+			Message: fmt.Sprintf("Generating thought %d...", i+1),
+			Depth:   i + 1,
 		})
+
+		var response string
+		var err error
+
+		// Call LLM with or without streaming
+		if useStreaming {
+			response, err = streamingProvider.ChatStream(ctx, messages, ChatOptions{
+				Temperature: 0.7,
+				MaxTokens:   2048,
+			}, func(token string) {
+				if c.onToken != nil {
+					c.onToken(token)
+				}
+			})
+		} else {
+			response, err = c.provider.Chat(ctx, messages, ChatOptions{
+				Temperature: 0.7,
+				MaxTokens:   2048,
+			})
+		}
+
 		if err != nil {
 			return result, fmt.Errorf("LLM call failed at step %d: %w", i+1, err)
 		}
@@ -96,7 +149,7 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 		var thinkingResp LLMThinkingResponse
 		if err := json.Unmarshal([]byte(response), &thinkingResp); err != nil {
 			// Try to extract JSON from the response if it has extra text
-			jsonStr := extractJSON(response)
+			jsonStr := utils.ExtractJSON(response)
 			if jsonStr == "" {
 				return result, fmt.Errorf("failed to parse thinking response at step %d: %w\nResponse: %s", i+1, err, response)
 			}
@@ -118,6 +171,14 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 		}
 		result.Steps = append(result.Steps, step)
 
+		// Emit progress: thought generated
+		c.emitProgress(ProgressUpdate{
+			Type:    EventTypeThought,
+			NodeID:  fmt.Sprintf("t%d", i+1),
+			Thought: utils.TruncateStr(thinkingResp.Thought, 100),
+			Depth:   i + 1,
+		})
+
 		// Add assistant response to conversation
 		messages = append(messages, ChatMessage{Role: "assistant", Content: response})
 
@@ -126,6 +187,14 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 			result.FinalAnswer = thinkingResp.FinalAnswer
 			result.Success = true
 			result.TotalSteps = len(result.Steps)
+
+			// Emit solution progress
+			c.emitProgress(ProgressUpdate{
+				Type:        EventTypeSolution,
+				FinalAnswer: thinkingResp.FinalAnswer,
+				IsSolution:  true,
+			})
+
 			return result, nil
 		}
 
@@ -140,25 +209,4 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 	result.TotalSteps = len(result.Steps)
 	result.FinalAnswer = "Maximum thinking steps reached without a definitive answer. Review the steps above."
 	return result, nil
-}
-
-// extractJSON tries to extract a JSON object from a string that might have extra text
-func extractJSON(s string) string {
-	start := -1
-	depth := 0
-
-	for i, c := range s {
-		if c == '{' {
-			if start == -1 {
-				start = i
-			}
-			depth++
-		} else if c == '}' {
-			depth--
-			if depth == 0 && start != -1 {
-				return s[start : i+1]
-			}
-		}
-	}
-	return ""
 }

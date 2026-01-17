@@ -5,21 +5,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"sync"
+
+	"reasoning-tools/utils"
 )
 
 // GraphOfThoughts implements reasoning as a graph where thoughts can merge
 type GraphOfThoughts struct {
-	provider    Provider
-	config      GoTConfig
-	tools       *ToolRegistry
-	nodes       map[string]*GoTNode
-	nodesMu     sync.RWMutex
-	totalVisits int
-	toolCalls   int
-	onProgress  func(ProgressUpdate)
+	provider      Provider
+	config        GoTConfig
+	tools         *ToolRegistry
+	nodes         map[string]*GoTNode
+	nodesMu       sync.RWMutex
+	totalVisits   int
+	toolCalls     int
+	onProgress    func(ProgressUpdate)
+	onToken       func(token string)
+	enableStreams bool
+}
+
+// SetTokenCallback sets a callback for token streaming
+func (g *GraphOfThoughts) SetTokenCallback(cb func(token string)) {
+	g.onToken = cb
+}
+
+// SetEnableStreaming enables or disables LLM streaming
+func (g *GraphOfThoughts) SetEnableStreaming(enable bool) {
+	g.enableStreams = enable
 }
 
 // GoTConfig configures the Graph of Thoughts algorithm
@@ -55,20 +70,20 @@ func DefaultGoTConfig() GoTConfig {
 // GoTNode represents a node in the thought graph (can have multiple parents)
 type GoTNode struct {
 	ID          string      `json:"id"`
-	NodeType    string      `json:"node_type"`              // "thought" or "tool"
+	NodeType    string      `json:"node_type"` // "thought" or "tool"
 	Thought     string      `json:"thought"`
 	Depth       int         `json:"depth"`
 	Score       float64     `json:"score"`
 	Visits      int         `json:"visits"`
 	TotalReward float64     `json:"total_reward"`
-	Parents     []string    `json:"parents,omitempty"`      // Multiple parents allowed
-	Children    []string    `json:"children,omitempty"`     // IDs of children
+	Parents     []string    `json:"parents,omitempty"`  // Multiple parents allowed
+	Children    []string    `json:"children,omitempty"` // IDs of children
 	IsTerminal  bool        `json:"is_terminal"`
 	IsSolution  bool        `json:"is_solution"`
 	Answer      string      `json:"answer,omitempty"`
-	MergedFrom  []string    `json:"merged_from,omitempty"`  // IDs of nodes merged into this
-	ToolCall    *ToolCall   `json:"tool_call,omitempty"`    // If this is a tool node
-	ToolResult  *ToolResult `json:"tool_result,omitempty"`  // Result of tool execution
+	MergedFrom  []string    `json:"merged_from,omitempty"` // IDs of nodes merged into this
+	ToolCall    *ToolCall   `json:"tool_call,omitempty"`   // If this is a tool node
+	ToolResult  *ToolResult `json:"tool_result,omitempty"` // Result of tool execution
 }
 
 // GoTResult represents the complete result
@@ -201,14 +216,14 @@ func (g *GraphOfThoughts) Solve(ctx context.Context, problem string) (*GoTResult
 				}
 
 				newNode = &GoTNode{
-					ID:       nodeID,
-					NodeType: "tool",
-					Thought:  fmt.Sprintf("Tool %s: %s", action.Tool, action.Input),
-					Depth:    selected.Depth + 1,
-					Score:    score,
-					Visits:   1,
+					ID:          nodeID,
+					NodeType:    "tool",
+					Thought:     fmt.Sprintf("Tool %s: %s", action.Tool, action.Input),
+					Depth:       selected.Depth + 1,
+					Score:       score,
+					Visits:      1,
 					TotalReward: score,
-					Parents:  []string{selected.ID},
+					Parents:     []string{selected.ID},
 					ToolCall: &ToolCall{
 						Tool:   action.Tool,
 						Input:  action.Input,
@@ -222,7 +237,7 @@ func (g *GraphOfThoughts) Solve(ctx context.Context, problem string) (*GoTResult
 					NodeID:     nodeID,
 					ToolName:   action.Tool,
 					ToolInput:  action.Input,
-					ToolOutput: truncateStr(toolResult.Output, 100),
+					ToolOutput: utils.TruncateStr(toolResult.Output, 100),
 					Score:      score,
 					Depth:      newNode.Depth,
 					TotalNodes: len(g.nodes) + 1,
@@ -271,7 +286,7 @@ func (g *GraphOfThoughts) Solve(ctx context.Context, problem string) (*GoTResult
 				g.emitProgress(ProgressUpdate{
 					Type:       "thought",
 					NodeID:     nodeID,
-					Thought:    truncateStr(thought, 100),
+					Thought:    utils.TruncateStr(thought, 100),
 					Score:      score,
 					Depth:      newNode.Depth,
 					TotalNodes: len(g.nodes) + 1,
@@ -301,9 +316,8 @@ func (g *GraphOfThoughts) Solve(ctx context.Context, problem string) (*GoTResult
 			g.nodesMu.Lock()
 			g.nodes[nodeID] = newNode
 			selected.Children = append(selected.Children, nodeID)
-			g.nodesMu.Unlock()
-
 			g.totalVisits++
+			g.nodesMu.Unlock()
 
 			// Backpropagate
 			g.backpropagate(newNode, newNode.Score)
@@ -434,10 +448,26 @@ Respond with ONLY a JSON array of strings:
 		{Role: "user", Content: prompt},
 	}
 
-	response, err := g.provider.Chat(ctx, messages, ChatOptions{
-		Temperature: g.config.Temperature,
-		MaxTokens:   2048,
-	})
+	var response string
+	var err error
+
+	// Use streaming if available and enabled
+	if sp, ok := g.provider.(StreamingProvider); ok && g.enableStreams && sp.SupportsStreaming() {
+		response, err = sp.ChatStream(ctx, messages, ChatOptions{
+			Temperature: g.config.Temperature,
+			MaxTokens:   2048,
+		}, func(token string) {
+			if g.onToken != nil {
+				g.onToken(token)
+			}
+		})
+	} else {
+		response, err = g.provider.Chat(ctx, messages, ChatOptions{
+			Temperature: g.config.Temperature,
+			MaxTokens:   2048,
+		})
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -450,7 +480,7 @@ func (g *GraphOfThoughts) parseActions(response string) []GoTAction {
 	var actions []GoTAction
 
 	// Try to parse as JSON array of actions
-	jsonStr := extractJSONArray(response)
+	jsonStr := utils.ExtractJSONArray(response)
 	if jsonStr != "" {
 		// Try parsing as array of GoTAction objects
 		if err := json.Unmarshal([]byte(jsonStr), &actions); err == nil && len(actions) > 0 {
@@ -467,7 +497,9 @@ func (g *GraphOfThoughts) parseActions(response string) []GoTAction {
 		}
 	}
 
-	// Fallback: parse as candidates (old behavior)
+	// Fallback: parse as candidates (old behavior) with logging for observability
+	fmt.Fprintf(os.Stderr, "[WARNING] graph_of_thoughts: failed to extract JSON array in parseActions, falling back to parsing candidates. Response preview: %s\n",
+		utils.TruncateStr(response, 100))
 	candidates := g.parseCandidates(response)
 	for _, c := range candidates {
 		actions = append(actions, GoTAction{Type: "thought", Content: c})
@@ -492,34 +524,12 @@ func (g *GraphOfThoughts) formatPathWithTools(path []*GoTNode) string {
 		if node.NodeType == "tool" && node.ToolResult != nil {
 			parts = append(parts, fmt.Sprintf("%d. (%.2f)%s [TOOL: %s] %s\n   → Result: %s",
 				i+1, node.Score, mergeInfo, node.ToolCall.Tool, node.ToolCall.Input,
-				truncateStr(node.ToolResult.Output, 100)))
+				utils.TruncateStr(node.ToolResult.Output, 100)))
 		} else {
 			parts = append(parts, fmt.Sprintf("%d. (%.2f)%s %s", i+1, node.Score, mergeInfo, node.Thought))
 		}
 	}
 	return strings.Join(parts, "\n")
-}
-
-// extractJSONArray extracts a JSON array from a string
-func extractJSONArray(s string) string {
-	start := strings.Index(s, "[")
-	if start == -1 {
-		return ""
-	}
-
-	depth := 0
-	for i := start; i < len(s); i++ {
-		switch s[i] {
-		case '[':
-			depth++
-		case ']':
-			depth--
-			if depth == 0 {
-				return s[start : i+1]
-			}
-		}
-	}
-	return ""
 }
 
 // findMergeCandidate finds a node to merge with based on semantic similarity
@@ -618,7 +628,7 @@ func (g *GraphOfThoughts) mergeIntoNode(target *GoTNode, newThought, parentID st
 // evaluateThought scores a thought and checks if it's a solution
 func (g *GraphOfThoughts) evaluateThought(ctx context.Context, thought, problem string, parent *GoTNode) (float64, bool, string, error) {
 	path := g.getPathToNode(parent)
-	pathStr := g.formatPath(path)
+	pathStr := g.formatPathWithTools(path)
 
 	prompt := fmt.Sprintf(`Evaluate this reasoning step for the problem.
 
@@ -800,14 +810,16 @@ func (g *GraphOfThoughts) formatPath(path []*GoTNode) string {
 func (g *GraphOfThoughts) parseCandidates(response string) []string {
 	var candidates []string
 
-	jsonStr := extractJSON(response)
+	jsonStr := utils.ExtractJSON(response)
 	if jsonStr != "" {
 		if err := json.Unmarshal([]byte(jsonStr), &candidates); err == nil {
 			return candidates
 		}
 	}
 
-	// Fallback: parse numbered list
+	// Fallback: parse numbered list with logging for observability
+	fmt.Fprintf(os.Stderr, "[WARNING] graph_of_thoughts: failed to extract JSON in parseCandidates, falling back to parsing numbered list. Response preview: %s\n",
+		utils.TruncateStr(response, 100))
 	lines := strings.Split(response, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -829,7 +841,7 @@ func (g *GraphOfThoughts) parseCandidates(response string) []string {
 }
 
 func parseGoTEvaluation(response string) (float64, bool, string, error) {
-	jsonStr := extractJSON(response)
+	jsonStr := utils.ExtractJSON(response)
 	if jsonStr == "" {
 		return 0.5, false, "", fmt.Errorf("no JSON in response")
 	}
@@ -853,13 +865,6 @@ func parseGoTEvaluation(response string) (float64, bool, string, error) {
 	}
 
 	return eval.Score, eval.IsSolution, eval.Answer, nil
-}
-
-func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }
 
 // FormatGoTResult formats the result for display
@@ -901,7 +906,7 @@ func FormatGoTResult(result *GoTResult) string {
 
 		if node.NodeType == "tool" && node.ToolResult != nil {
 			sb.WriteString(fmt.Sprintf("%d. %s (score: %.2f)%s [%s] %s\n", i, icon, node.Score, mergeInfo, node.ToolCall.Tool, node.ToolCall.Input))
-			sb.WriteString(fmt.Sprintf("   → %s\n\n", truncateStr(node.ToolResult.Output, 100)))
+			sb.WriteString(fmt.Sprintf("   → %s\n\n", utils.TruncateStr(node.ToolResult.Output, 100)))
 		} else {
 			sb.WriteString(fmt.Sprintf("%d. %s (score: %.2f)%s %s\n\n", i, icon, node.Score, mergeInfo, node.Thought))
 		}

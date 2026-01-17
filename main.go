@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
@@ -13,11 +15,29 @@ import (
 )
 
 func main() {
+	// CLI flags
+	transport := flag.String("transport", "stdio", "Transport mode: stdio or sse")
+	port := flag.String("port", "8080", "Port for SSE server (only used with -transport=sse)")
+	baseURL := flag.String("base-url", "", "Base URL for SSE server (default: http://localhost:<port>)")
+	flag.Parse()
+
+	// Also check environment variables
+	if t := os.Getenv("MCP_TRANSPORT"); t != "" && *transport == "stdio" {
+		*transport = t
+	}
+	if p := os.Getenv("MCP_PORT"); p != "" && *port == "8080" {
+		*port = p
+	}
+	if b := os.Getenv("MCP_BASE_URL"); b != "" && *baseURL == "" {
+		*baseURL = b
+	}
+
 	// Create MCP server
 	s := server.NewMCPServer(
 		"reasoning-tools",
 		"3.2.0",
 		server.WithToolCapabilities(true),
+		server.WithLogging(),
 	)
 
 	// Register simple sequential thinking tool
@@ -39,6 +59,18 @@ func main() {
 		),
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
+		),
+		mcp.WithString("stream_mode",
+			mcp.Description("Streaming mode: 'none', 'tokens', 'events', 'both' (default: none)"),
+		),
+		mcp.WithBoolean("stderr_stream",
+			mcp.Description("Stream tokens to stderr for real-time terminal output (default: false)"),
+		),
+		mcp.WithBoolean("mcp_logging",
+			mcp.Description("Send MCP logging notifications (default: false)"),
+		),
+		mcp.WithBoolean("mcp_progress",
+			mcp.Description("Send MCP progress notifications (default: false)"),
 		),
 	)
 	s.AddTool(simpleTool, handleSequentialThink)
@@ -83,6 +115,18 @@ func main() {
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
 		),
+		mcp.WithString("stream_mode",
+			mcp.Description("Streaming mode: 'none', 'tokens', 'events', 'both' (default: none)"),
+		),
+		mcp.WithBoolean("stderr_stream",
+			mcp.Description("Stream tokens to stderr for real-time terminal output (default: false)"),
+		),
+		mcp.WithBoolean("mcp_logging",
+			mcp.Description("Send MCP logging notifications (default: false)"),
+		),
+		mcp.WithBoolean("mcp_progress",
+			mcp.Description("Send MCP progress notifications (default: false)"),
+		),
 	)
 	s.AddTool(gotTool, handleGraphOfThoughts)
 
@@ -119,6 +163,18 @@ func main() {
 		),
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
+		),
+		mcp.WithString("stream_mode",
+			mcp.Description("Streaming mode: 'none', 'tokens', 'events', 'both' (default: none)"),
+		),
+		mcp.WithBoolean("stderr_stream",
+			mcp.Description("Stream tokens to stderr for real-time terminal output (default: false)"),
+		),
+		mcp.WithBoolean("mcp_logging",
+			mcp.Description("Send MCP logging notifications (default: false)"),
+		),
+		mcp.WithBoolean("mcp_progress",
+			mcp.Description("Send MCP progress notifications (default: false)"),
 		),
 	)
 	s.AddTool(reflexionTool, handleReflexion)
@@ -157,6 +213,18 @@ func main() {
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
 		),
+		mcp.WithString("stream_mode",
+			mcp.Description("Streaming mode: 'none', 'tokens', 'events', 'both' (default: none)"),
+		),
+		mcp.WithBoolean("stderr_stream",
+			mcp.Description("Stream tokens to stderr for real-time terminal output (default: false)"),
+		),
+		mcp.WithBoolean("mcp_logging",
+			mcp.Description("Send MCP logging notifications (default: false)"),
+		),
+		mcp.WithBoolean("mcp_progress",
+			mcp.Description("Send MCP progress notifications (default: false)"),
+		),
 	)
 	s.AddTool(dialecticTool, handleDialecticReason)
 
@@ -172,9 +240,33 @@ func main() {
 	)
 	s.AddTool(memoryTool, handleMemoryStats)
 
-	// Start stdio server
-	if err := server.ServeStdio(s); err != nil {
-		log.Fatalf("Server error: %v", err)
+	// Start server based on transport mode
+	switch *transport {
+	case "sse":
+		// Set default base URL if not specified
+		if *baseURL == "" {
+			*baseURL = fmt.Sprintf("http://localhost:%s", *port)
+		}
+
+		sseServer := server.NewSSEServer(s,
+			server.WithBaseURL(*baseURL),
+			server.WithKeepAlive(true),
+		)
+
+		log.Printf("Starting SSE server on :%s (base URL: %s)", *port, *baseURL)
+		log.Printf("SSE endpoint: %s/sse", *baseURL)
+		log.Printf("Message endpoint: %s/message", *baseURL)
+
+		if err := http.ListenAndServe(":"+*port, sseServer); err != nil {
+			log.Fatalf("SSE server error: %v", err)
+		}
+
+	case "stdio":
+		fallthrough
+	default:
+		if err := server.ServeStdio(s); err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
 	}
 }
 
@@ -194,52 +286,59 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 		maxThoughts = int(mt)
 	}
 
-	includeStream := false
-	if s, ok := args["stream"].(bool); ok {
-		includeStream = s
-	}
-
 	// Get provider
 	provider, err := getProviderFromArgs(args)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
 
-	// Setup streaming
-	sm := NewStreamingManager("sequential_thinking")
+	// Setup streaming infrastructure
+	sc := SetupStreaming(ctx, args, "sequential_thinking")
 
-	// Create client and run sequential thinking
+	// Set up progress tracking
+	sc.SetProgressTotal(maxThoughts)
+
+	// Create client with streaming callbacks
 	client := &SequentialClient{provider: provider}
+
+	// Set progress callback for event streaming
+	client.SetProgressCallback(func(update ProgressUpdate) {
+		sc.Manager.AddProgressEvent(update)
+		sc.Notifier.SendProgress(update)
+		if update.Type == "thought" {
+			sc.SendProgressStep(update.Message)
+		}
+	})
+
+	// Set token callback for token streaming
+	client.SetTokenCallback(func(token string) {
+		sc.Manager.AddTokenEvent(token, "")
+		sc.Notifier.SendToken(token)
+	})
+
+	// Enable LLM streaming if token streaming is requested
+	client.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
+
+	// Run sequential thinking
 	result, err := client.Think(ctx, problem, maxThoughts)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Thinking failed: %v", err)), nil
 	}
 
-	// Add steps to stream log
-	for i, step := range result.Steps {
-		sm.AddProgressEvent(ProgressUpdate{
-			Type:    "thought",
-			NodeID:  fmt.Sprintf("t%d", i+1),
-			Thought: truncateStr(step.Thought, 100),
-			Depth:   i + 1,
-		})
-	}
-	if result.Success {
-		sm.AddProgressEvent(ProgressUpdate{
-			Type:        "solution",
-			FinalAnswer: result.FinalAnswer,
-			IsSolution:  true,
-		})
-	}
-
 	// Format output
 	var output string
-	if includeStream {
-		wrapped := WrapWithStreaming(result, sm, true)
-		outputBytes, _ := json.MarshalIndent(wrapped, "", "  ")
+	if sc.ShouldIncludeStream() {
+		wrapped := WrapWithStreaming(result, sc.Manager, true)
+		outputBytes, err := json.MarshalIndent(wrapped, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
 		output = string(outputBytes)
 	} else {
-		outputBytes, _ := json.MarshalIndent(result, "", "  ")
+		outputBytes, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
 		output = string(outputBytes)
 	}
 
@@ -263,10 +362,8 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
 
-	includeStream := false
-	if s, ok := args["stream"].(bool); ok {
-		includeStream = s
-	}
+	// Setup streaming infrastructure
+	sc := SetupStreaming(ctx, args, "graph_of_thoughts")
 
 	// Build config
 	config := DefaultGoTConfig()
@@ -296,14 +393,26 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 		config.EnabledTools = toolList
 	}
 
-	// Setup streaming
-	sm := NewStreamingManager("graph_of_thoughts")
-
 	// Run Graph of Thoughts
 	got := NewGraphOfThoughts(provider, config)
+
+	// Set up progress tracking
+	sc.SetProgressTotal(config.MaxNodes)
+
 	got.SetProgressCallback(func(update ProgressUpdate) {
-		sm.AddProgressEvent(update)
+		sc.Manager.AddProgressEvent(update)
+		sc.Notifier.SendProgress(update)
+		if update.Type == "thought" || update.Type == "merge" {
+			sc.SendProgressStep(update.Message)
+		}
 	})
+
+	// Set token callback if streaming provider is available
+	got.SetTokenCallback(func(token string) {
+		sc.Manager.AddTokenEvent(token, "")
+		sc.Notifier.SendToken(token)
+	})
+	got.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
 
 	result, err := got.Solve(ctx, problem)
 	if err != nil {
@@ -312,10 +421,10 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 
 	// Format output
 	var output string
-	if includeStream {
+	if sc.ShouldIncludeStream() {
 		output = FormatGoTResult(result)
 		output += "\n\n## Stream Log\n\n"
-		output += sm.FormatCompact()
+		output += sc.Manager.FormatCompact()
 	} else {
 		output = FormatGoTResult(result)
 	}
@@ -340,10 +449,8 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
 
-	includeStream := false
-	if s, ok := args["stream"].(bool); ok {
-		includeStream = s
-	}
+	// Setup streaming infrastructure
+	sc := SetupStreaming(ctx, args, "reflexion")
 
 	// Build config
 	config := DefaultReflexionConfig()
@@ -367,14 +474,26 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 		config.EnabledTools = toolList
 	}
 
-	// Setup streaming
-	sm := NewStreamingManager("reflexion")
-
 	// Run Reflexion
 	reflexion := NewReflexion(provider, config)
+
+	// Set up progress tracking (each attempt has ~3 phases: attempt, evaluate, reflect)
+	sc.SetProgressTotal(config.MaxAttempts * 3)
+
 	reflexion.SetProgressCallback(func(update ProgressUpdate) {
-		sm.AddProgressEvent(update)
+		sc.Manager.AddProgressEvent(update)
+		sc.Notifier.SendProgress(update)
+		if update.Type == "thought" || update.Type == "evaluation" {
+			sc.SendProgressStep(update.Message)
+		}
 	})
+
+	// Set token callback if streaming provider is available
+	reflexion.SetTokenCallback(func(token string) {
+		sc.Manager.AddTokenEvent(token, "")
+		sc.Notifier.SendToken(token)
+	})
+	reflexion.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
 
 	result, err := reflexion.Reason(ctx, problem)
 	if err != nil {
@@ -383,10 +502,10 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 
 	// Format output
 	var output string
-	if includeStream {
+	if sc.ShouldIncludeStream() {
 		output = FormatReflexionResult(result)
 		output += "\n\n## Stream Log\n\n"
-		output += sm.FormatCompact()
+		output += sc.Manager.FormatCompact()
 	} else {
 		output = FormatReflexionResult(result)
 	}
@@ -411,10 +530,8 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
 
-	includeStream := false
-	if s, ok := args["stream"].(bool); ok {
-		includeStream = s
-	}
+	// Setup streaming infrastructure
+	sc := SetupStreaming(ctx, args, "dialectic_reason")
 
 	// Build config
 	config := DefaultDialecticConfig()
@@ -438,52 +555,39 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 		config.EnabledTools = toolList
 	}
 
-	// Setup streaming
-	sm := NewStreamingManager("dialectic_reason")
-
 	// Run dialectical reasoning
 	reasoner := NewDialecticalReasoner(provider, config)
+
+	// Set up progress tracking (each round has ~3 phases: thesis, antithesis, synthesis)
+	sc.SetProgressTotal(config.MaxRounds * 3)
+
 	reasoner.SetProgressCallback(func(update ProgressUpdate) {
-		sm.AddProgressEvent(update)
+		sc.Manager.AddProgressEvent(update)
+		sc.Notifier.SendProgress(update)
+		// Send MCP progress notification for major phases
+		if update.Type == "thought" || update.Type == "evaluation" || update.Type == "solution" {
+			sc.SendProgressStep(update.Message)
+		}
 	})
+
+	// Set token callback if streaming provider is available
+	reasoner.SetTokenCallback(func(token string) {
+		sc.Manager.AddTokenEvent(token, "")
+		sc.Notifier.SendToken(token)
+	})
+	reasoner.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
+
 	result, err := reasoner.Reason(ctx, problem)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Dialectic reasoning failed: %v", err)), nil
 	}
 
-	// Add steps to stream log
-	for _, step := range result.Steps {
-		sm.AddProgressEvent(ProgressUpdate{
-			Type:    "thought",
-			Message: fmt.Sprintf("Round %d: Thesis", step.Round),
-			Score:   step.Thesis.Verification.Score,
-		})
-		sm.AddProgressEvent(ProgressUpdate{
-			Type:    "thought",
-			Message: fmt.Sprintf("Round %d: Antithesis", step.Round),
-			Score:   step.Antithesis.Verification.Score,
-		})
-		sm.AddProgressEvent(ProgressUpdate{
-			Type:       "evaluation",
-			Message:    fmt.Sprintf("Round %d: Synthesis", step.Round),
-			Score:      step.Synthesis.Verification.Score,
-			IsSolution: step.Resolved,
-		})
-	}
-	if result.Success {
-		sm.AddProgressEvent(ProgressUpdate{
-			Type:        "solution",
-			FinalAnswer: result.FinalAnswer,
-			Score:       result.Confidence,
-		})
-	}
-
 	// Format output
 	var output string
-	if includeStream {
+	if sc.ShouldIncludeStream() {
 		output = FormatDialecticResult(result)
 		output += "\n\n## Stream Log\n\n"
-		output += sm.FormatCompact()
+		output += sc.Manager.FormatCompact()
 	} else {
 		output = FormatDialecticResult(result)
 	}
@@ -498,7 +602,7 @@ func handleListProviders(ctx context.Context, request mcp.CallToolRequest) (*mcp
 			"aliases":       []string{"glm", "zhipu"},
 			"env_key":       "ZAI_API_KEY or GLM_API_KEY",
 			"default_model": "glm-4",
-			"base_url":      "https://open.bigmodel.cn/api/paas/v4",
+			"base_url":      "https://api.z.ai/api/paas/v4",
 		},
 		{
 			"name":          "openai",
@@ -553,7 +657,12 @@ func handleListProviders(ctx context.Context, request mcp.CallToolRequest) (*mcp
 		providers[i]["configured"] = isProviderConfigured(providers[i]["name"].(string))
 	}
 
-	output, _ := json.MarshalIndent(providers, "", "  ")
+	output, err := json.MarshalIndent(providers, "", "  ")
+	if err != nil {
+		log.Printf("Warning: failed to serialize providers list: %v", err)
+		// Return empty array as fallback for diagnostics
+		output = []byte("[]")
+	}
 	return mcp.NewToolResultText(string(output)), nil
 }
 
@@ -569,7 +678,16 @@ func handleMemoryStats(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 	reflexion := NewReflexion(provider, config)
 	stats := reflexion.GetMemoryStats()
 
-	output, _ := json.MarshalIndent(stats, "", "  ")
+	output, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		log.Printf("Warning: failed to serialize memory stats: %v", err)
+		// Return a simplified fallback for diagnostics
+		fallback := map[string]interface{}{
+			"error":     "Failed to retrieve detailed memory statistics",
+			"timestamp": "N/A",
+		}
+		output, _ = json.MarshalIndent(fallback, "", "  ")
+	}
 	return mcp.NewToolResultText(string(output)), nil
 }
 
@@ -630,4 +748,3 @@ func isProviderConfigured(name string) bool {
 	}
 	return false
 }
-

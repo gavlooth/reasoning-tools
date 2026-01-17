@@ -1,8 +1,11 @@
-module glm-sequential-thinking
+module reasoning-tools
 
-go 1.25.5
+go 1.23.0
 
-require github.com/mark3labs/mcp-go v0.43.2
+require (
+	github.com/mark3labs/mcp-go v0.43.2
+	golang.org/x/text v0.21.0
+)
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect

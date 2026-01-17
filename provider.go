@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 )
 
 // ChatMessage represents a message in the chat
@@ -22,6 +22,16 @@ type ChatMessage struct {
 type Provider interface {
 	Name() string
 	Chat(ctx context.Context, messages []ChatMessage, opts ChatOptions) (string, error)
+}
+
+// TokenCallback is called for each token during streaming
+type TokenCallback func(token string)
+
+// StreamingProvider extends Provider with streaming capabilities
+type StreamingProvider interface {
+	Provider
+	ChatStream(ctx context.Context, messages []ChatMessage, opts ChatOptions, onToken TokenCallback) (string, error)
+	SupportsStreaming() bool
 }
 
 // ChatOptions for provider calls
@@ -41,41 +51,44 @@ type ProviderConfig struct {
 
 // NewProvider creates a provider from config
 func NewProvider(cfg ProviderConfig) (Provider, error) {
+	// Get global configuration for timeouts
+	config := GetConfig()
+
 	switch strings.ToLower(cfg.Type) {
 	case "openai":
 		return &OpenAIProvider{
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://api.openai.com/v1"),
 			model:   withDefault(cfg.Model, "gpt-4o-mini"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Timeout: config.OpenAITimeout},
 		}, nil
 	case "anthropic":
 		return &AnthropicProvider{
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://api.anthropic.com/v1"),
 			model:   withDefault(cfg.Model, "claude-3-haiku-20240307"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Timeout: config.AnthropicTimeout},
 		}, nil
 	case "groq":
 		return &OpenAIProvider{
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://api.groq.com/openai/v1"),
 			model:   withDefault(cfg.Model, "llama-3.1-70b-versatile"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Timeout: config.GroqTimeout},
 			name:    "groq",
 		}, nil
 	case "ollama":
 		return &OllamaProvider{
 			baseURL: withDefault(cfg.BaseURL, "http://localhost:11434"),
 			model:   withDefault(cfg.Model, "llama3.1"),
-			client:  &http.Client{Timeout: 300 * time.Second},
+			client:  &http.Client{Timeout: config.OllamaTimeout},
 		}, nil
 	case "deepseek":
 		return &OpenAIProvider{
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://api.deepseek.com/v1"),
 			model:   withDefault(cfg.Model, "deepseek-chat"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Timeout: config.DeepSeekTimeout},
 			name:    "deepseek",
 		}, nil
 	case "openrouter":
@@ -83,19 +96,19 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://openrouter.ai/api/v1"),
 			model:   withDefault(cfg.Model, "meta-llama/llama-3.1-70b-instruct"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Timeout: config.OpenRouterTimeout},
 			name:    "openrouter",
 			headers: map[string]string{
-				"HTTP-Referer": "https://github.com/glm-sequential-thinking",
+				"HTTP-Referer": "https://github.com/gavlooth/reasoning-tools",
 				"X-Title":      "GLM Sequential Thinking",
 			},
 		}, nil
 	case "zai", "glm", "zhipu":
 		return &OpenAIProvider{
 			apiKey:  cfg.APIKey,
-			baseURL: withDefault(cfg.BaseURL, "https://open.bigmodel.cn/api/paas/v4"),
+			baseURL: withDefault(cfg.BaseURL, "https://api.z.ai/api/paas/v4"),
 			model:   withDefault(cfg.Model, "glm-4"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Timeout: config.ZaiTimeout},
 			name:    "zai",
 		}, nil
 	case "together":
@@ -103,7 +116,7 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://api.together.xyz/v1"),
 			model:   withDefault(cfg.Model, "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"),
-			client:  &http.Client{Timeout: 120 * time.Second},
+			client:  &http.Client{Timeout: config.TogetherTimeout},
 			name:    "together",
 		}, nil
 	default:
@@ -452,4 +465,336 @@ func withDefaultInt(val, def int) int {
 		return def
 	}
 	return val
+}
+
+// ============ Streaming Support ============
+
+// SupportsStreaming returns true for OpenAI-compatible providers
+func (p *OpenAIProvider) SupportsStreaming() bool {
+	return true
+}
+
+// ChatStream streams tokens from OpenAI-compatible APIs
+func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []ChatMessage, opts ChatOptions, onToken TokenCallback) (string, error) {
+	model := opts.Model
+	if model == "" {
+		model = p.model
+	}
+
+	reqBody := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+		"stream":   true,
+	}
+	if opts.Temperature > 0 {
+		reqBody["temperature"] = opts.Temperature
+	}
+	if opts.MaxTokens > 0 {
+		reqBody["max_tokens"] = opts.MaxTokens
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+	for k, v := range p.headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return parseOpenAISSE(resp.Body, onToken)
+}
+
+// parseOpenAISSE parses OpenAI-style SSE stream
+func parseOpenAISSE(reader io.Reader, onToken TokenCallback) (string, error) {
+	scanner := bufio.NewScanner(reader)
+	var accumulated strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		// Parse SSE data lines
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+
+			// Check for stream end
+			if data == "[DONE]" {
+				break
+			}
+
+			// Parse JSON
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+					FinishReason string `json:"finish_reason"`
+				} `json:"choices"`
+			}
+
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue // Skip malformed chunks
+			}
+
+			if len(chunk.Choices) > 0 {
+				content := chunk.Choices[0].Delta.Content
+				if content != "" {
+					accumulated.WriteString(content)
+					if onToken != nil {
+						onToken(content)
+					}
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return accumulated.String(), fmt.Errorf("stream read error: %w", err)
+	}
+
+	return accumulated.String(), nil
+}
+
+// SupportsStreaming returns true for Anthropic
+func (p *AnthropicProvider) SupportsStreaming() bool {
+	return true
+}
+
+// ChatStream streams tokens from Anthropic API
+func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []ChatMessage, opts ChatOptions, onToken TokenCallback) (string, error) {
+	model := opts.Model
+	if model == "" {
+		model = p.model
+	}
+
+	// Convert messages to Anthropic format
+	var systemPrompt string
+	var anthropicMessages []map[string]string
+
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			systemPrompt = msg.Content
+		} else {
+			anthropicMessages = append(anthropicMessages, map[string]string{
+				"role":    msg.Role,
+				"content": msg.Content,
+			})
+		}
+	}
+
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"messages":   anthropicMessages,
+		"max_tokens": withDefaultInt(opts.MaxTokens, 2048),
+		"stream":     true,
+	}
+	if systemPrompt != "" {
+		reqBody["system"] = systemPrompt
+	}
+	if opts.Temperature > 0 {
+		reqBody["temperature"] = opts.Temperature
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(jsonBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", p.apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return parseAnthropicSSE(resp.Body, onToken)
+}
+
+// parseAnthropicSSE parses Anthropic-style SSE stream
+func parseAnthropicSSE(reader io.Reader, onToken TokenCallback) (string, error) {
+	scanner := bufio.NewScanner(reader)
+	var accumulated strings.Builder
+	var eventType string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Skip empty lines
+		if line == "" {
+			eventType = ""
+			continue
+		}
+
+		// Parse event type
+		if strings.HasPrefix(line, "event: ") {
+			eventType = strings.TrimPrefix(line, "event: ")
+			continue
+		}
+
+		// Parse data
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+
+			// Handle content_block_delta events
+			if eventType == "content_block_delta" {
+				var delta struct {
+					Type  string `json:"type"`
+					Delta struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					} `json:"delta"`
+				}
+
+				if err := json.Unmarshal([]byte(data), &delta); err != nil {
+					continue
+				}
+
+				if delta.Delta.Text != "" {
+					accumulated.WriteString(delta.Delta.Text)
+					if onToken != nil {
+						onToken(delta.Delta.Text)
+					}
+				}
+			}
+
+			// Check for message_stop
+			if eventType == "message_stop" {
+				break
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return accumulated.String(), fmt.Errorf("stream read error: %w", err)
+	}
+
+	return accumulated.String(), nil
+}
+
+// SupportsStreaming returns true for Ollama
+func (p *OllamaProvider) SupportsStreaming() bool {
+	return true
+}
+
+// ChatStream streams tokens from Ollama API (NDJSON format)
+func (p *OllamaProvider) ChatStream(ctx context.Context, messages []ChatMessage, opts ChatOptions, onToken TokenCallback) (string, error) {
+	model := opts.Model
+	if model == "" {
+		model = p.model
+	}
+
+	reqBody := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+		"stream":   true,
+	}
+	if opts.Temperature > 0 {
+		reqBody["options"] = map[string]interface{}{
+			"temperature": opts.Temperature,
+		}
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/api/chat", bytes.NewReader(jsonBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return parseOllamaNDJSON(resp.Body, onToken)
+}
+
+// parseOllamaNDJSON parses Ollama NDJSON stream
+func parseOllamaNDJSON(reader io.Reader, onToken TokenCallback) (string, error) {
+	scanner := bufio.NewScanner(reader)
+	var accumulated strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var chunk struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Done bool `json:"done"`
+		}
+
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Message.Content != "" {
+			accumulated.WriteString(chunk.Message.Content)
+			if onToken != nil {
+				onToken(chunk.Message.Content)
+			}
+		}
+
+		if chunk.Done {
+			break
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return accumulated.String(), fmt.Errorf("stream read error: %w", err)
+	}
+
+	return accumulated.String(), nil
 }
