@@ -1138,25 +1138,37 @@ if __name__ == "__main__":
 	// Run Python AST analysis
 	cmd := exec.CommandContext(astCtx, pythonCmd, "-c", astAnalysisScript)
 
-	// Write the code to stdin with proper synchronization to avoid goroutine leak
+	// Setup stdin for writing code to the process
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil
 	}
 
-	// Use a channel to track when the write completes
-	writeDone := make(chan struct{})
+	// Write to stdin in a goroutine to avoid deadlock
 	go func() {
-		defer close(writeDone)
 		defer stdin.Close()
 		stdin.Write([]byte(code))
 	}()
 
-	// Wait for command to complete
-	output, err := cmd.CombinedOutput()
+	// Capture output to avoid deadlock with context cancellation
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-	// Wait for the write goroutine to complete to avoid goroutine leak
-	<-writeDone
+	// Start command (CombinedOutput would block on stdin write)
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] AST validation unavailable, using pattern matching only: %v\n", err)
+		return nil
+	}
+
+	// Wait for command to complete (context already has timeout)
+	err = cmd.Wait()
+
+	output := stdout.String()
+	if stderr.Len() > 0 {
+		output += "\n" + stderr.String()
+	}
+
 	if err != nil {
 		// If AST analysis fails (e.g., Python not available), log a warning but don't block
 		// This maintains backward compatibility while adding security when possible
@@ -1171,7 +1183,7 @@ if __name__ == "__main__":
 		Message    string   `json:"message"`
 	}
 
-	if err := json.Unmarshal(output, &astResult); err != nil {
+	if err := json.Unmarshal([]byte(output), &astResult); err != nil {
 		// If we can't parse the result, log but don't block
 		fmt.Fprintf(os.Stderr, "[WARN] Could not parse AST validation result: %v\n", err)
 		return nil
