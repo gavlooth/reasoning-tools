@@ -569,14 +569,19 @@ Only suggest tools if they would genuinely help verify the claim. Respond with [
 
 	// Execute up to 2 tool calls
 	for i, tc := range toolCalls {
-		if i >= 2 || d.toolCalls >= d.config.MaxToolCalls {
+		// Check tool call limit with mutex protection
+		d.toolCallsMu.Lock()
+		withinLimit := i < 2 && d.toolCalls < d.config.MaxToolCalls
+		if withinLimit {
+			d.toolCalls++
+		}
+		d.toolCallsMu.Unlock()
+
+		if !withinLimit {
 			break
 		}
 
 		result := d.tools.Execute(ctx, tc.Tool, tc.Input)
-		d.toolCallsMu.Lock()
-		d.toolCalls++
-		d.toolCallsMu.Unlock()
 		results = append(results, result)
 
 		d.emitProgress(ProgressUpdate{

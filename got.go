@@ -204,12 +204,22 @@ func (g *GraphOfThoughts) Solve(ctx context.Context, problem string) (*GoTResult
 			nodeID := fmt.Sprintf("n%d_%d", g.totalVisits, i)
 			var newNode *GoTNode
 
-			if action.Type == "tool" && g.config.EnableTools && g.tools != nil && g.toolCalls < g.config.MaxToolCalls {
+			if action.Type == "tool" && g.config.EnableTools && g.tools != nil {
+				// Check tool call limit with mutex protection
+				g.toolCallsMu.Lock()
+				withinLimit := g.toolCalls < g.config.MaxToolCalls
+				if withinLimit {
+					g.toolCalls++
+				}
+				g.toolCallsMu.Unlock()
+
+				if !withinLimit {
+					// Skip tool execution, create regular thought instead
+					continue
+				}
+
 				// Execute tool and create tool node
 				toolResult := g.tools.Execute(ctx, action.Tool, action.Input)
-				g.toolCallsMu.Lock()
-				g.toolCalls++
-				g.toolCallsMu.Unlock()
 				result.ToolsUsed[action.Tool]++
 
 				// Determine score based on tool success
