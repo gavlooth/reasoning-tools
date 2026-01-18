@@ -422,7 +422,12 @@ func (g *GraphOfThoughts) generateActions(ctx context.Context, node *GoTNode, pr
 	pathStr := g.formatPathWithTools(path)
 
 	var prompt string
-	if g.config.EnableTools && g.tools != nil && g.toolCalls < g.config.MaxToolCalls {
+	// Check tool call limit with mutex protection
+	g.toolCallsMu.Lock()
+	withinLimit := g.toolCalls < g.config.MaxToolCalls
+	g.toolCallsMu.Unlock()
+
+	if g.config.EnableTools && g.tools != nil && withinLimit {
 		toolsPrompt := g.tools.GetToolsPrompt()
 		prompt = fmt.Sprintf(`Problem: %s
 
