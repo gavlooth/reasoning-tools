@@ -275,14 +275,13 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 			lastErr = err
 			// Retry on connection reset or timeout
 			if isTransientError(err) {
-				// Close connection before retrying
-				if resp != nil {
-					resp.Body.Close()
-				}
 				continue
 			}
 			return "", fmt.Errorf("request failed: %w", err)
 		}
+		// Ensure response body is closed on all code paths (defer handles return statements,
+		// but continue statements need explicit close to release resources before next iteration)
+		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -299,8 +298,6 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 				resp.Body.Close()
 				continue
 			}
-			// Close response body before returning error
-			resp.Body.Close()
 			return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 		}
 
@@ -320,8 +317,6 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 		}
 
 		if chatResp.Error != nil {
-			// Close response body before returning error
-			resp.Body.Close()
 			return "", fmt.Errorf("API error: %s", chatResp.Error.Message)
 		}
 
@@ -329,8 +324,6 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 			return "", fmt.Errorf("no choices in response")
 		}
 
-		// Close response body on success path
-		resp.Body.Close()
 		return chatResp.Choices[0].Message.Content, nil
 	}
 
