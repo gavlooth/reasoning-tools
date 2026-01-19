@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -24,6 +25,9 @@ type Config struct {
 	// Tool timeouts
 	CodeExecTimeout time.Duration
 	WebFetchTimeout time.Duration
+
+	// Concurrency control
+	MaxConcurrentLLMRequests int // Maximum concurrent LLM API requests (0 = unlimited)
 }
 
 // Validation bounds for timeout values
@@ -34,21 +38,26 @@ const (
 	maxTimeout = 1 * time.Hour
 	// Maximum tool timeout: 5 minutes (tools should complete quickly)
 	maxToolTimeout = 5 * time.Minute
+
+	// Concurrency limits
+	defaultMaxConcurrentLLMRequests = 2  // Default: allow 2 concurrent LLM requests
+	maxConcurrentLLMRequests        = 20 // Hard cap to prevent abuse
 )
 
 // DefaultConfig returns default configuration values
 func DefaultConfig() *Config {
 	return &Config{
-		OpenAITimeout:     120 * time.Second,
-		AnthropicTimeout:  120 * time.Second,
-		GroqTimeout:       120 * time.Second,
-		OllamaTimeout:     300 * time.Second,
-		DeepSeekTimeout:   120 * time.Second,
-		OpenRouterTimeout: 120 * time.Second,
-		ZaiTimeout:        120 * time.Second,
-		TogetherTimeout:   120 * time.Second,
-		CodeExecTimeout:   10 * time.Second,
-		WebFetchTimeout:   15 * time.Second,
+		OpenAITimeout:            120 * time.Second,
+		AnthropicTimeout:         120 * time.Second,
+		GroqTimeout:              120 * time.Second,
+		OllamaTimeout:            300 * time.Second,
+		DeepSeekTimeout:          120 * time.Second,
+		OpenRouterTimeout:        120 * time.Second,
+		ZaiTimeout:               120 * time.Second,
+		TogetherTimeout:          120 * time.Second,
+		CodeExecTimeout:          10 * time.Second,
+		WebFetchTimeout:          15 * time.Second,
+		MaxConcurrentLLMRequests: defaultMaxConcurrentLLMRequests,
 	}
 }
 
@@ -172,29 +181,184 @@ func LoadConfig() *Config {
 		}
 	}
 
+	// Concurrency control
+	if v := os.Getenv("LLM_MAX_CONCURRENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n <= 0 {
+				cfg.MaxConcurrentLLMRequests = 0 // 0 means unlimited
+				log.Printf("[CONFIG] LLM_MAX_CONCURRENT set to unlimited")
+			} else if n > maxConcurrentLLMRequests {
+				cfg.MaxConcurrentLLMRequests = maxConcurrentLLMRequests
+				log.Printf("[CONFIG] LLM_MAX_CONCURRENT (%d) exceeds maximum (%d), clamping", n, maxConcurrentLLMRequests)
+			} else {
+				cfg.MaxConcurrentLLMRequests = n
+			}
+		}
+	}
+
 	return cfg
 }
 
 // Global config instance (initialized lazily)
 var (
 	globalConfig *Config
-	configOnce   sync.Once
+	configLock   sync.RWMutex
 )
 
 // GetConfig returns the global configuration, initializing it lazily on first access.
 // This allows tests to set environment variables before the first call to GetConfig(),
 // resolving the initialization order dependency issue.
 func GetConfig() *Config {
-	configOnce.Do(func() {
-		globalConfig = LoadConfig()
-	})
+	// Fast path: read lock for concurrent reads
+	configLock.RLock()
+	if globalConfig != nil {
+		configLock.RUnlock()
+		return globalConfig
+	}
+	configLock.RUnlock()
+
+	// Slow path: write lock for initialization
+	configLock.Lock()
+	defer configLock.Unlock()
+
+	// Double-check: another goroutine might have initialized while we were waiting
+	if globalConfig != nil {
+		return globalConfig
+	}
+
+	// Initialize config
+	globalConfig = LoadConfig()
 	return globalConfig
 }
 
-// ResetConfig resets the global configuration for testing purposes.
+// ResetConfig resets global configuration for testing purposes.
 // This allows tests to set different environment variables and reload configuration.
-// NOTE: This function is not thread-safe and should only be used in tests.
+//
+// NOTE: This function is designed for test scenarios only. It is not safe
+// for concurrent use with GetConfig() outside of controlled test environments.
 func ResetConfig() {
+	// Acquire write lock to safely reset configuration
+	// This blocks any concurrent reads and ensures we don't reset during initialization
+	configLock.Lock()
+	defer configLock.Unlock()
+
+	// Reset global config pointer to nil
 	globalConfig = nil
-	configOnce = sync.Once{}
+
+	// Reset FIFO limiter
+	llmLimiterLock.Lock()
+	if llmLimiter != nil {
+		llmLimiter.Stop()
+		llmLimiter = nil
+	}
+	llmLimiterLock.Unlock()
+}
+
+// ============ LLM Request Rate Limiting (FIFO Queue) ============
+
+// FIFOLimiter implements a fair, first-in-first-out rate limiter using channels.
+// Requests are processed in the order they arrive, with bounded concurrency.
+type FIFOLimiter struct {
+	queue chan chan func() // queue of response channels, preserves FIFO order
+	done  chan struct{}    // signals shutdown
+}
+
+// NewFIFOLimiter creates a new FIFO rate limiter with the given concurrency limit.
+func NewFIFOLimiter(maxConcurrent int) *FIFOLimiter {
+	l := &FIFOLimiter{
+		queue: make(chan chan func(), 10000), // large buffer to avoid blocking enqueuers
+		done:  make(chan struct{}),
+	}
+	go l.dispatcher(maxConcurrent)
+	return l
+}
+
+// dispatcher processes queued requests in FIFO order, respecting concurrency limits.
+func (l *FIFOLimiter) dispatcher(maxConcurrent int) {
+	sem := make(chan struct{}, maxConcurrent)
+
+	for {
+		select {
+		case respChan := <-l.queue:
+			// Acquire a slot (blocks if all slots are in use)
+			sem <- struct{}{}
+			// Send release function to the waiting goroutine
+			select {
+			case respChan <- func() { <-sem }:
+				// Successfully sent
+			default:
+				// Waiter gave up (context cancelled), release slot immediately
+				<-sem
+			}
+		case <-l.done:
+			return
+		}
+	}
+}
+
+// Acquire waits for a slot in FIFO order.
+// Returns a release function that MUST be called when done, or an error if context was cancelled.
+func (l *FIFOLimiter) Acquire(ctx context.Context) (func(), error) {
+	respChan := make(chan func(), 1)
+
+	// Enqueue our response channel - FIFO order preserved by channel semantics
+	select {
+	case l.queue <- respChan:
+		// Enqueued successfully
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	// Wait for our turn
+	select {
+	case release := <-respChan:
+		return release, nil
+	case <-ctx.Done():
+		// Context cancelled while waiting - dispatcher will handle the orphaned entry
+		return nil, ctx.Err()
+	}
+}
+
+// Stop shuts down the dispatcher goroutine.
+func (l *FIFOLimiter) Stop() {
+	close(l.done)
+}
+
+// Global FIFO limiter instance
+var (
+	llmLimiter     *FIFOLimiter
+	llmLimiterLock sync.Mutex
+)
+
+// getLLMLimiter returns the global LLM request limiter, initializing it if needed.
+// Returns nil if rate limiting is disabled (MaxConcurrentLLMRequests == 0).
+func getLLMLimiter() *FIFOLimiter {
+	llmLimiterLock.Lock()
+	defer llmLimiterLock.Unlock()
+
+	if llmLimiter != nil {
+		return llmLimiter
+	}
+
+	cfg := GetConfig()
+	if cfg.MaxConcurrentLLMRequests <= 0 {
+		return nil // Unlimited
+	}
+
+	llmLimiter = NewFIFOLimiter(cfg.MaxConcurrentLLMRequests)
+	log.Printf("[RATE-LIMIT] FIFO limiter initialized with capacity %d", cfg.MaxConcurrentLLMRequests)
+	return llmLimiter
+}
+
+// AcquireLLMSlot acquires a slot for making an LLM request in FIFO order.
+// Blocks until a slot is available or context is cancelled.
+// Returns a release function that MUST be called when done, or an error if context was cancelled.
+func AcquireLLMSlot(ctx context.Context) (release func(), err error) {
+	limiter := getLLMLimiter()
+	if limiter == nil {
+		// No rate limiting, return no-op release
+		return func() {}, nil
+	}
+
+	return limiter.Acquire(ctx)
 }

@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=heefoo
 WorkingDirectory=/home/heefoo/reasoning-tools
-ExecStart=/home/heefoo/reasoning-tools/reasoning-tools -transport=sse -port=8080
+ExecStart=/home/heefoo/reasoning-tools/reasoning-tools -transport=sse -port=9847
 Restart=on-failure
 RestartSec=5
 
@@ -14,6 +14,9 @@ RestartSec=5
 Environment=MCP_STDERR_STREAM=true
 Environment=MCP_LOGGING_STREAM=true
 Environment=MCP_PROGRESS_STREAM=true
+
+# Rate limiting for concurrent LLM requests (default: 2, 0 = unlimited)
+Environment=LLM_MAX_CONCURRENT=2
 
 # Environment variables for LLM provider (uncomment and configure as needed)
 # Environment=LLM_PROVIDER=openai
