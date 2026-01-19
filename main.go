@@ -14,6 +14,42 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+func validateToolNames(toolList []string, availableTools []string) []string {
+	var invalid []string
+	var valid []string
+
+	for _, tool := range toolList {
+		if tool == "" {
+			continue
+		}
+		found := false
+		for _, avail := range availableTools {
+			if tool == avail {
+				found = true
+				break
+			}
+		}
+		if !found {
+			invalid = append(invalid, tool)
+		} else {
+			valid = append(valid, tool)
+		}
+	}
+
+	// Log warnings for invalid tool names
+	if len(invalid) > 0 {
+		log.Printf("[CONFIG] Warning: ignoring invalid tool name(s) in enabled_tools: %s. Available tools: %v",
+			strings.Join(invalid, ", "), availableTools)
+	}
+
+	return valid
+}
+
+func getAvailableToolNames() []string {
+	registry := NewToolRegistry()
+	return registry.GetRegisteredToolNames()
+}
+
 func main() {
 	// CLI flags
 	transport := flag.String("transport", "stdio", "Transport mode: stdio or sse")
@@ -390,6 +426,7 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 		for i := range toolList {
 			toolList[i] = strings.TrimSpace(toolList[i])
 		}
+		toolList = validateToolNames(toolList, getAvailableToolNames())
 		config.EnabledTools = toolList
 	}
 
@@ -471,6 +508,7 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 		for i := range toolList {
 			toolList[i] = strings.TrimSpace(toolList[i])
 		}
+		toolList = validateToolNames(toolList, getAvailableToolNames())
 		config.EnabledTools = toolList
 	}
 
@@ -552,6 +590,7 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 		for i := range toolList {
 			toolList[i] = strings.TrimSpace(toolList[i])
 		}
+		toolList = validateToolNames(toolList, getAvailableToolNames())
 		config.EnabledTools = toolList
 	}
 
@@ -601,7 +640,7 @@ func handleListProviders(ctx context.Context, request mcp.CallToolRequest) (*mcp
 			"name":          "zai",
 			"aliases":       []string{"glm", "zhipu"},
 			"env_key":       "ZAI_API_KEY or GLM_API_KEY",
-			"default_model": "glm-4",
+			"default_model": "glm-4.7",
 			"base_url":      "https://api.z.ai/api/paas/v4",
 		},
 		{

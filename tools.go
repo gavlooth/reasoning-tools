@@ -163,6 +163,15 @@ func (r *ToolRegistry) GetAvailableTools() []Tool {
 	return tools
 }
 
+// GetRegisteredToolNames returns all registered tool names (including disabled ones)
+func (r *ToolRegistry) GetRegisteredToolNames() []string {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	return names
+}
+
 // GetToolsPrompt generates a prompt describing available tools
 func (r *ToolRegistry) GetToolsPrompt() string {
 	tools := r.GetAvailableTools()
@@ -625,7 +634,9 @@ func (t *WebFetchTool) search(ctx context.Context, query string) (string, error)
 
 func stripHTML(html string) string {
 	// Remove script and style tags with content
-	re := regexp.MustCompile(`(?s)<(script|style)[^>]*>.*?</\1>`)
+	re := regexp.MustCompile(`(?s)<script[^>]*>.*?</script>`)
+	html = re.ReplaceAllString(html, "")
+	re = regexp.MustCompile(`(?s)<style[^>]*>.*?</style>`)
 	html = re.ReplaceAllString(html, "")
 
 	// Remove HTML tags
