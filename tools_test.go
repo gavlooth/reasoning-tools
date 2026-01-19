@@ -128,7 +128,7 @@ func TestPythonCodeValidation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePythonCode(tc.code)
+			err := validatePythonCode(context.Background(), tc.code)
 			if tc.shouldError && err == nil {
 				t.Errorf("%s: expected error for dangerous code, but got none (description: %s)", tc.name, tc.description)
 			}
@@ -495,7 +495,7 @@ func TestPythonCodeValidationAdvanced(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePythonCode(tc.code)
+			err := validatePythonCode(context.Background(), tc.code)
 			if tc.shouldError && err == nil {
 				t.Errorf("%s: expected error for dangerous code, but got none (description: %s)", tc.name, tc.description)
 			}
@@ -522,7 +522,7 @@ print("test result")
 
 	// Call validatePythonCode - with the fix, it should return immediately
 	// without deadlock regardless of Python's exit state
-	err := validatePythonCode(testCode)
+	err := validatePythonCode(context.Background(), testCode)
 
 	// We don't assert a specific result because Python might not be available
 	// The important thing is that it returns at all (no deadlock)
@@ -543,7 +543,7 @@ func TestMultipleRapidValidations(t *testing.T) {
 	// If there's a goroutine leak or deadlock, this will eventually fail
 	for i := 0; i < 10; i++ {
 		code := fmt.Sprintf("x = %d\nprint(x)", i)
-		validatePythonCode(code)
+		validatePythonCode(context.Background(), code)
 	}
 	// If we get here without hanging or resource exhaustion, the fix is working
 	t.Logf("Successfully completed 10 rapid validation calls")

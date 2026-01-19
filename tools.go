@@ -466,7 +466,7 @@ func (t *CodeExecutorTool) Execute(ctx context.Context, input string) (string, e
 	}
 
 	// Security: Validate input against dangerous patterns
-	if err := validatePythonCode(input); err != nil {
+	if err := validatePythonCode(ctx, input); err != nil {
 		return "", fmt.Errorf("code validation failed: %w", err)
 	}
 
@@ -859,7 +859,7 @@ func toFloat64(v interface{}) float64 {
 // This function uses a multi-layered approach:
 // 1. Fast string-based pattern matching for obvious threats
 // 2. AST-based analysis for deeper structural validation
-func validatePythonCode(code string) error {
+func validatePythonCode(ctx context.Context, code string) error {
 	// Normalize code for checking
 	lowerCode := strings.ToLower(code)
 
@@ -1143,7 +1143,7 @@ if __name__ == "__main__":
 `
 
 	// Create context with timeout for AST analysis
-	astCtx, astCancel := context.WithTimeout(context.Background(), config.CodeExecTimeout)
+	astCtx, astCancel := context.WithTimeout(ctx, config.CodeExecTimeout)
 	defer astCancel()
 
 	// Run Python AST analysis
