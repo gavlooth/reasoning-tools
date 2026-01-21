@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"regexp"
+	"strings"
 
 	"reasoning-tools/utils"
 )
@@ -145,17 +148,14 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 			return result, fmt.Errorf("LLM call failed at step %d: %w", i+1, err)
 		}
 
-		// Parse the response as JSON
-		var thinkingResp LLMThinkingResponse
-		if err := json.Unmarshal([]byte(response), &thinkingResp); err != nil {
-			// Try to extract JSON from the response if it has extra text
-			jsonStr := utils.ExtractJSON(response)
-			if jsonStr == "" {
-				return result, fmt.Errorf("failed to parse thinking response at step %d: %w\nResponse: %s", i+1, err, response)
-			}
-			if err := json.Unmarshal([]byte(jsonStr), &thinkingResp); err != nil {
-				return result, fmt.Errorf("failed to parse extracted JSON at step %d: %w\nJSON: %s", i+1, err, jsonStr)
-			}
+		// Parse the response as JSON (with fallback to structured text)
+		thinkingResp, usedFallback, err := parseThinkingResponse(response, i+1, maxThoughts)
+		if err != nil {
+			return result, fmt.Errorf("failed to parse thinking response at step %d: %w", i+1, err)
+		}
+		if usedFallback {
+			fmt.Fprintf(os.Stderr, "[WARNING] sequential_thinking: falling back to text parsing at step %d. Response preview: %s\n",
+				i+1, utils.TruncateStr(response, 120))
 		}
 
 		// Record the step
@@ -209,4 +209,60 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 	result.TotalSteps = len(result.Steps)
 	result.FinalAnswer = "Maximum thinking steps reached without a definitive answer. Review the steps above."
 	return result, nil
+}
+
+func parseThinkingResponse(response string, stepNum, maxThoughts int) (LLMThinkingResponse, bool, error) {
+	var thinkingResp LLMThinkingResponse
+	if err := json.Unmarshal([]byte(response), &thinkingResp); err == nil {
+		return thinkingResp, false, nil
+	}
+
+	jsonStr := utils.ExtractJSON(response)
+	if jsonStr != "" {
+		if err := json.Unmarshal([]byte(jsonStr), &thinkingResp); err == nil {
+			return thinkingResp, false, nil
+		}
+	}
+
+	thought := strings.TrimSpace(response)
+	if thought == "" {
+		return LLMThinkingResponse{}, true, fmt.Errorf("empty response")
+	}
+
+	answer := extractFinalAnswerFromText(response)
+	nextNeeded := true
+	if answer != "" {
+		nextNeeded = false
+	}
+	if stepNum >= maxThoughts {
+		nextNeeded = false
+		if answer == "" {
+			answer = thought
+		}
+	}
+	if !nextNeeded && answer == "" {
+		answer = thought
+	}
+
+	totalThoughts := maxThoughts
+	if !nextNeeded {
+		totalThoughts = stepNum
+	}
+
+	return LLMThinkingResponse{
+		ThoughtNumber:     stepNum,
+		TotalThoughts:     totalThoughts,
+		Thought:           thought,
+		NextThoughtNeeded: nextNeeded,
+		FinalAnswer:       answer,
+	}, true, nil
+}
+
+func extractFinalAnswerFromText(response string) string {
+	re := regexp.MustCompile(`(?is)(?:final answer|answer)\s*[:\-]\s*(.+)$`)
+	match := re.FindStringSubmatch(response)
+	if len(match) > 1 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
 }

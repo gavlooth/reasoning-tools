@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -863,7 +865,42 @@ func (g *GraphOfThoughts) parseCandidates(response string) []string {
 func parseGoTEvaluation(response string) (float64, bool, string, error) {
 	jsonStr := utils.ExtractJSON(response)
 	if jsonStr == "" {
-		return 0.5, false, "", fmt.Errorf("no JSON in response")
+		// Fallback: parse from text
+		fmt.Fprintf(os.Stderr, "[WARNING] graph_of_thoughts: failed to extract JSON in parseGoTEvaluation, using text fallback. Response preview: %s\n",
+			utils.TruncateStr(response, 120))
+		score := 0.5
+		isSolution := false
+		answer := ""
+
+		scoreRe := regexp.MustCompile(`(?is)score\s*[:\-]\s*([0-9]*\.?[0-9]+)`)
+		if match := scoreRe.FindStringSubmatch(response); len(match) > 1 {
+			if val, err := strconv.ParseFloat(match[1], 64); err == nil {
+				if val > 1 && val <= 100 {
+					val = val / 100
+				}
+				if val < 0 {
+					val = 0
+				}
+				if val > 1 {
+					val = 1
+				}
+				score = val
+			}
+		}
+
+		solutionRe := regexp.MustCompile(`(?is)is_solution\s*[:\-]\s*(true|false)`)
+		if match := solutionRe.FindStringSubmatch(response); len(match) > 1 {
+			isSolution = strings.EqualFold(match[1], "true")
+		} else if strings.Contains(strings.ToLower(response), "final answer") {
+			isSolution = true
+		}
+
+		answerRe := regexp.MustCompile(`(?is)(?:final answer|answer)\s*[:\-]\s*(.+)$`)
+		if match := answerRe.FindStringSubmatch(response); len(match) > 1 {
+			answer = strings.TrimSpace(match[1])
+		}
+
+		return score, isSolution, answer, nil
 	}
 
 	var eval struct {

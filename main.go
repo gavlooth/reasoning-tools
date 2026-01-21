@@ -52,13 +52,14 @@ func getAvailableToolNames() []string {
 
 func main() {
 	// CLI flags
-	transport := flag.String("transport", "stdio", "Transport mode: stdio or sse")
-	port := flag.String("port", "8080", "Port for SSE server (only used with -transport=sse)")
+	transport := flag.String("transport", "sse", "Transport mode: stdio, sse, streamable-http, or dual")
+	port := flag.String("port", "8080", "Port for HTTP server (used with -transport=sse or -transport=streamable-http)")
 	baseURL := flag.String("base-url", "", "Base URL for SSE server (default: http://localhost:<port>)")
+	httpPath := flag.String("http-path", "/mcp", "Path for Streamable HTTP endpoint (only used with -transport=streamable-http)")
 	flag.Parse()
 
 	// Also check environment variables
-	if t := os.Getenv("MCP_TRANSPORT"); t != "" && *transport == "stdio" {
+	if t := os.Getenv("MCP_TRANSPORT"); t != "" && *transport == "sse" {
 		*transport = t
 	}
 	if p := os.Getenv("MCP_PORT"); p != "" && *port == "8080" {
@@ -66,6 +67,13 @@ func main() {
 	}
 	if b := os.Getenv("MCP_BASE_URL"); b != "" && *baseURL == "" {
 		*baseURL = b
+	}
+	if p := os.Getenv("MCP_HTTP_PATH"); p != "" && *httpPath == "/mcp" {
+		*httpPath = p
+	}
+	if shouldAutoUseStdio(*transport) {
+		*transport = "stdio"
+		log.Printf("[CONFIG] Auto-detected stdio transport (non-interactive stdin/stdout). Set -transport or MCP_TRANSPORT to override.")
 	}
 
 	// Create MCP server
@@ -92,6 +100,9 @@ func main() {
 		),
 		mcp.WithString("model",
 			mcp.Description("Model to use (provider-specific, uses default if not set)"),
+		),
+		mcp.WithString("fallback_providers",
+			mcp.Description("Comma-separated list of fallback providers to try on failure"),
 		),
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
@@ -148,6 +159,9 @@ func main() {
 		mcp.WithString("model",
 			mcp.Description("Model to use (provider-specific)"),
 		),
+		mcp.WithString("fallback_providers",
+			mcp.Description("Comma-separated list of fallback providers to try on failure"),
+		),
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
 		),
@@ -197,6 +211,9 @@ func main() {
 		mcp.WithString("model",
 			mcp.Description("Model to use (provider-specific)"),
 		),
+		mcp.WithString("fallback_providers",
+			mcp.Description("Comma-separated list of fallback providers to try on failure"),
+		),
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
 		),
@@ -231,6 +248,12 @@ func main() {
 		mcp.WithNumber("confidence_target",
 			mcp.Description("Stop when synthesis reaches this confidence 0-1 (default: 0.85)"),
 		),
+		mcp.WithNumber("max_tokens",
+			mcp.Description("Maximum tokens per LLM call (default: 1024)"),
+		),
+		mcp.WithBoolean("fast_mode",
+			mcp.Description("Run a single-pass dialectic (thesis/antithesis/synthesis) without verification (default: false)"),
+		),
 		mcp.WithBoolean("enable_tools",
 			mcp.Description("Enable tool-backed verification (default: false)"),
 		),
@@ -245,6 +268,18 @@ func main() {
 		),
 		mcp.WithString("model",
 			mcp.Description("Model to use (provider-specific)"),
+		),
+		mcp.WithString("thesis_model",
+			mcp.Description("Override model for thesis generation (provider-specific)"),
+		),
+		mcp.WithString("antithesis_model",
+			mcp.Description("Override model for antithesis generation (provider-specific)"),
+		),
+		mcp.WithString("synthesis_model",
+			mcp.Description("Override model for synthesis generation (provider-specific)"),
+		),
+		mcp.WithString("fallback_providers",
+			mcp.Description("Comma-separated list of fallback providers to try on failure"),
 		),
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
@@ -297,6 +332,54 @@ func main() {
 			log.Fatalf("SSE server error: %v", err)
 		}
 
+	case "streamable-http", "streamable_http", "http":
+		if *httpPath == "" {
+			*httpPath = "/mcp"
+		}
+		httpPathNormalized := normalizeHTTPPath(*httpPath)
+		httpServer := server.NewStreamableHTTPServer(s, server.WithEndpointPath(httpPathNormalized))
+		log.Printf("Starting Streamable HTTP server on :%s (endpoint path: %s)", *port, httpPathNormalized)
+		if err := httpServer.Start(":" + *port); err != nil {
+			log.Fatalf("Streamable HTTP server error: %v", err)
+		}
+
+	case "dual", "both", "sse+http", "sse+streamable-http":
+		if *baseURL == "" {
+			*baseURL = fmt.Sprintf("http://localhost:%s", *port)
+		}
+		if *httpPath == "" {
+			*httpPath = "/mcp"
+		}
+		httpPathNormalized := normalizeHTTPPath(*httpPath)
+
+		sseServer := server.NewSSEServer(s,
+			server.WithBaseURL(*baseURL),
+			server.WithKeepAlive(true),
+		)
+		streamableServer := server.NewStreamableHTTPServer(s, server.WithEndpointPath(httpPathNormalized))
+
+		ssePath := sseServer.CompleteSsePath()
+		messagePath := sseServer.CompleteMessagePath()
+
+		mux := http.NewServeMux()
+		registerPathVariants(mux, ssePath, dualSSECompatHandler(sseServer, streamableServer))
+		registerPathVariants(mux, messagePath, sseServer)
+		registerPathVariants(mux, httpPathNormalized, streamableServer)
+
+		log.Printf("Starting dual transport server on :%s", *port)
+		log.Printf("SSE base URL: %s", *baseURL)
+		log.Printf("SSE endpoint: %s", ssePath)
+		log.Printf("Message endpoint: %s", messagePath)
+		log.Printf("Streamable HTTP endpoint path: %s", httpPathNormalized)
+
+		srv := &http.Server{
+			Addr:    ":" + *port,
+			Handler: mux,
+		}
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatalf("Dual server error: %v", err)
+		}
+
 	case "stdio":
 		fallthrough
 	default:
@@ -304,6 +387,65 @@ func main() {
 			log.Fatalf("Server error: %v", err)
 		}
 	}
+}
+
+func shouldAutoUseStdio(transport string) bool {
+	if transport != "sse" || os.Getenv("MCP_TRANSPORT") != "" || wasFlagProvided("transport") {
+		return false
+	}
+	return !isTerminalFile(os.Stdin) && !isTerminalFile(os.Stdout)
+}
+
+func isTerminalFile(file *os.File) bool {
+	info, err := file.Stat()
+	if err != nil {
+		return true
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func wasFlagProvided(name string) bool {
+	provided := false
+	flag.CommandLine.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			provided = true
+		}
+	})
+	return provided
+}
+
+func normalizeHTTPPath(path string) string {
+	if path == "" {
+		return "/mcp"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if len(path) > 1 && strings.HasSuffix(path, "/") {
+		path = strings.TrimSuffix(path, "/")
+	}
+	return path
+}
+
+func registerPathVariants(mux *http.ServeMux, path string, handler http.Handler) {
+	if path == "" {
+		return
+	}
+	normalized := normalizeHTTPPath(path)
+	mux.Handle(normalized, handler)
+	if normalized != "/" {
+		mux.Handle(normalized+"/", handler)
+	}
+}
+
+func dualSSECompatHandler(sseServer http.Handler, streamableServer http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get(server.HeaderKeySessionID) == "" {
+			sseServer.ServeHTTP(w, r)
+			return
+		}
+		streamableServer.ServeHTTP(w, r)
+	})
 }
 
 func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -323,7 +465,7 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 	}
 
 	// Get provider
-	provider, err := getProviderFromArgs(args)
+	provider, err := getProviderFromArgsForTool(args, "sequential_thinking")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
@@ -355,6 +497,16 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 	// Enable LLM streaming if token streaming is requested
 	client.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
 
+	// Cache (only when not streaming)
+	cache := getToolCache()
+	cacheKey := ""
+	if cache != nil && sc.Mode == StreamModeNone {
+		cacheKey = buildToolCacheKey("sequential_thinking", provider.Name(), args)
+		if cached, ok := cache.Get(cacheKey); ok {
+			return mcp.NewToolResultText(cached), nil
+		}
+	}
+
 	// Run sequential thinking
 	result, err := client.Think(ctx, problem, maxThoughts)
 	if err != nil {
@@ -378,6 +530,9 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 		output = string(outputBytes)
 	}
 
+	if cache != nil && cacheKey != "" && sc.Mode == StreamModeNone {
+		cache.Set(cacheKey, output)
+	}
 	return mcp.NewToolResultText(output), nil
 }
 
@@ -393,7 +548,7 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 	}
 
 	// Get provider
-	provider, err := getProviderFromArgs(args)
+	provider, err := getProviderFromArgsForTool(args, "graph_of_thoughts")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
@@ -430,6 +585,16 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 		config.EnabledTools = toolList
 	}
 
+	// Cache (only when not streaming)
+	cache := getToolCache()
+	cacheKey := ""
+	if cache != nil && sc.Mode == StreamModeNone {
+		cacheKey = buildToolCacheKey("graph_of_thoughts", provider.Name(), args)
+		if cached, ok := cache.Get(cacheKey); ok {
+			return mcp.NewToolResultText(cached), nil
+		}
+	}
+
 	// Run Graph of Thoughts
 	got := NewGraphOfThoughts(provider, config)
 
@@ -459,13 +624,23 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 	// Format output
 	var output string
 	if sc.ShouldIncludeStream() {
-		output = FormatGoTResult(result)
-		output += "\n\n## Stream Log\n\n"
-		output += sc.Manager.FormatCompact()
+		wrapped := WrapWithStreaming(result, sc.Manager, true)
+		outputBytes, err := json.MarshalIndent(wrapped, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
+		output = string(outputBytes)
 	} else {
-		output = FormatGoTResult(result)
+		outputBytes, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
+		output = string(outputBytes)
 	}
 
+	if cache != nil && cacheKey != "" && sc.Mode == StreamModeNone {
+		cache.Set(cacheKey, output)
+	}
 	return mcp.NewToolResultText(output), nil
 }
 
@@ -481,7 +656,7 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 	}
 
 	// Get provider
-	provider, err := getProviderFromArgs(args)
+	provider, err := getProviderFromArgsForTool(args, "reflexion")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
@@ -533,6 +708,15 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 	})
 	reflexion.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
 
+	cache := getToolCache()
+	cacheKey := ""
+	if cache != nil && sc.Mode == StreamModeNone {
+		cacheKey = buildToolCacheKey("reflexion", provider.Name(), args)
+		if cached, ok := cache.Get(cacheKey); ok {
+			return mcp.NewToolResultText(cached), nil
+		}
+	}
+
 	result, err := reflexion.Reason(ctx, problem)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Reflexion failed: %v", err)), nil
@@ -541,13 +725,23 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 	// Format output
 	var output string
 	if sc.ShouldIncludeStream() {
-		output = FormatReflexionResult(result)
-		output += "\n\n## Stream Log\n\n"
-		output += sc.Manager.FormatCompact()
+		wrapped := WrapWithStreaming(result, sc.Manager, true)
+		outputBytes, err := json.MarshalIndent(wrapped, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
+		output = string(outputBytes)
 	} else {
-		output = FormatReflexionResult(result)
+		outputBytes, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
+		output = string(outputBytes)
 	}
 
+	if cache != nil && cacheKey != "" && sc.Mode == StreamModeNone {
+		cache.Set(cacheKey, output)
+	}
 	return mcp.NewToolResultText(output), nil
 }
 
@@ -563,7 +757,7 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 	}
 
 	// Get provider
-	provider, err := getProviderFromArgs(args)
+	provider, err := getProviderFromArgsForTool(args, "dialectic_reason")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
@@ -578,6 +772,14 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 	}
 	if ct, ok := args["confidence_target"].(float64); ok {
 		config.ConfidenceTarget = ct
+	}
+	if fm, ok := args["fast_mode"].(bool); ok {
+		config.FastMode = fm
+	}
+	if mt, ok := args["max_tokens"].(float64); ok {
+		if mt > 0 {
+			config.MaxTokens = clampMaxTokens(int(mt))
+		}
 	}
 	if et, ok := args["enable_tools"].(bool); ok {
 		config.EnableTools = et
@@ -594,11 +796,25 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 		config.EnabledTools = toolList
 	}
 
+	if model := getStringArgOrEnv(args, "thesis_model", toolEnvKey("dialectic_reason", "THESIS_MODEL")); model != "" {
+		config.ThesisModel = model
+	}
+	if model := getStringArgOrEnv(args, "antithesis_model", toolEnvKey("dialectic_reason", "ANTITHESIS_MODEL")); model != "" {
+		config.AntithesisModel = model
+	}
+	if model := getStringArgOrEnv(args, "synthesis_model", toolEnvKey("dialectic_reason", "SYNTHESIS_MODEL")); model != "" {
+		config.SynthesisModel = model
+	}
+
 	// Run dialectical reasoning
 	reasoner := NewDialecticalReasoner(provider, config)
 
 	// Set up progress tracking (each round has ~3 phases: thesis, antithesis, synthesis)
-	sc.SetProgressTotal(config.MaxRounds * 3)
+	totalSteps := config.MaxRounds * 3
+	if config.FastMode {
+		totalSteps = 1
+	}
+	sc.SetProgressTotal(totalSteps)
 
 	reasoner.SetProgressCallback(func(update ProgressUpdate) {
 		sc.Manager.AddProgressEvent(update)
@@ -616,6 +832,15 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 	})
 	reasoner.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
 
+	cache := getToolCache()
+	cacheKey := ""
+	if cache != nil && sc.Mode == StreamModeNone {
+		cacheKey = buildToolCacheKey("dialectic_reason", provider.Name(), args)
+		if cached, ok := cache.Get(cacheKey); ok {
+			return mcp.NewToolResultText(cached), nil
+		}
+	}
+
 	result, err := reasoner.Reason(ctx, problem)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Dialectic reasoning failed: %v", err)), nil
@@ -624,13 +849,23 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 	// Format output
 	var output string
 	if sc.ShouldIncludeStream() {
-		output = FormatDialecticResult(result)
-		output += "\n\n## Stream Log\n\n"
-		output += sc.Manager.FormatCompact()
+		wrapped := WrapWithStreaming(result, sc.Manager, true)
+		outputBytes, err := json.MarshalIndent(wrapped, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
+		output = string(outputBytes)
 	} else {
-		output = FormatDialecticResult(result)
+		outputBytes, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
+		}
+		output = string(outputBytes)
 	}
 
+	if cache != nil && cacheKey != "" && sc.Mode == StreamModeNone {
+		cache.Set(cacheKey, output)
+	}
 	return mcp.NewToolResultText(output), nil
 }
 
@@ -730,45 +965,16 @@ func handleMemoryStats(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 	return mcp.NewToolResultText(string(output)), nil
 }
 
-func getProviderFromArgs(args map[string]interface{}) (Provider, error) {
-	providerType := ""
-	if p, ok := args["provider"].(string); ok {
-		providerType = p
+func getStringArgOrEnv(args map[string]interface{}, argName, envKey string) string {
+	if val, ok := args[argName].(string); ok && val != "" {
+		return val
 	}
-
-	model := ""
-	if m, ok := args["model"].(string); ok {
-		model = m
-	}
-
-	if providerType == "" {
-		// Use environment-based detection
-		return NewProviderFromEnv()
-	}
-
-	cfg := ProviderConfig{
-		Type:    providerType,
-		APIKey:  getAPIKeyForProvider(providerType),
-		BaseURL: os.Getenv("LLM_BASE_URL"),
-		Model:   model,
-	}
-
-	// Check for provider-specific env overrides
-	if providerType == "zai" || providerType == "glm" {
-		if url := os.Getenv("ZAI_BASE_URL"); url != "" {
-			cfg.BaseURL = url
-		}
-		if m := os.Getenv("GLM_MODEL"); m != "" && model == "" {
-			cfg.Model = m
-		}
-	}
-
-	return NewProvider(cfg)
+	return os.Getenv(envKey)
 }
 
 func isProviderConfigured(name string) bool {
 	switch name {
-	case "zai", "glm":
+	case "zai", "glm", "zhipu":
 		return os.Getenv("ZAI_API_KEY") != "" || os.Getenv("GLM_API_KEY") != ""
 	case "openai":
 		return os.Getenv("OPENAI_API_KEY") != ""

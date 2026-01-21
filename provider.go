@@ -44,6 +44,16 @@ type ChatOptions struct {
 	Model       string
 }
 
+func normalizeChatOptions(opts ChatOptions) ChatOptions {
+	if opts.Temperature != 0 {
+		opts.Temperature = clampTemperature(opts.Temperature)
+	}
+	if opts.MaxTokens != 0 {
+		opts.MaxTokens = clampMaxTokens(opts.MaxTokens)
+	}
+	return opts
+}
+
 // ProviderConfig holds provider configuration
 type ProviderConfig struct {
 	Type    string // openai, anthropic, groq, ollama, deepseek, openrouter, zai
@@ -226,6 +236,15 @@ func (p *OpenAIProvider) Name() string {
 }
 
 func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts ChatOptions) (string, error) {
+	release, err := AcquireLLMSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	if release != nil {
+		defer release()
+	}
+
+	opts = normalizeChatOptions(opts)
 	model := opts.Model
 	if model == "" {
 		model = p.model
@@ -304,7 +323,8 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 		var chatResp struct {
 			Choices []struct {
 				Message struct {
-					Content string `json:"content"`
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content,omitempty"` // Some models (e.g., z.ai) use this field
 				} `json:"message"`
 			} `json:"choices"`
 			Error *struct {
@@ -321,10 +341,34 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 		}
 
 		if len(chatResp.Choices) == 0 {
-			return "", fmt.Errorf("no choices in response")
+			// Include full response details in error for better debugging
+			var responseSnippet string
+			if len(body) > 500 {
+				responseSnippet = string(body)[:500] + "..."
+			} else {
+				responseSnippet = string(body)
+			}
+			return "", fmt.Errorf("no choices in API response (provider: %s, model: %s, status: %d, body: %s)",
+				p.Name(), model, resp.StatusCode, responseSnippet)
 		}
 
-		return chatResp.Choices[0].Message.Content, nil
+		content := chatResp.Choices[0].Message.Content
+		if content == "" {
+			content = chatResp.Choices[0].Message.ReasoningContent
+		}
+		if content == "" {
+			// Empty response - log full body for debugging
+			var responseSnippet string
+			if len(body) > 500 {
+				responseSnippet = string(body)[:500] + "..."
+			} else {
+				responseSnippet = string(body)
+			}
+			return "", fmt.Errorf("empty content in API response (provider: %s, model: %s, status: %d, body: %s)",
+				p.Name(), model, resp.StatusCode, responseSnippet)
+		}
+
+		return content, nil
 	}
 
 	// Note: response body is already closed above on all paths
@@ -364,6 +408,15 @@ func (p *AnthropicProvider) Name() string {
 }
 
 func (p *AnthropicProvider) Chat(ctx context.Context, messages []ChatMessage, opts ChatOptions) (string, error) {
+	release, err := AcquireLLMSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	if release != nil {
+		defer release()
+	}
+
+	opts = normalizeChatOptions(opts)
 	model := opts.Model
 	if model == "" {
 		model = p.model
@@ -462,6 +515,15 @@ func (p *OllamaProvider) Name() string {
 }
 
 func (p *OllamaProvider) Chat(ctx context.Context, messages []ChatMessage, opts ChatOptions) (string, error) {
+	release, err := AcquireLLMSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	if release != nil {
+		defer release()
+	}
+
+	opts = normalizeChatOptions(opts)
 	model := opts.Model
 	if model == "" {
 		model = p.model
@@ -507,7 +569,8 @@ func (p *OllamaProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 
 	var chatResp struct {
 		Message struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content,omitempty"` // Some models (e.g., z.ai) use this field
 		} `json:"message"`
 	}
 
@@ -534,6 +597,15 @@ func (p *OpenAIProvider) SupportsStreaming() bool {
 
 // ChatStream streams tokens from OpenAI-compatible APIs
 func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []ChatMessage, opts ChatOptions, onToken TokenCallback) (string, error) {
+	release, err := AcquireLLMSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	if release != nil {
+		defer release()
+	}
+
+	opts = normalizeChatOptions(opts)
 	model := opts.Model
 	if model == "" {
 		model = p.model
@@ -612,7 +684,8 @@ func parseOpenAISSE(reader io.Reader, onToken TokenCallback) (string, error) {
 			var chunk struct {
 				Choices []struct {
 					Delta struct {
-						Content string `json:"content"`
+						Content          string `json:"content"`
+						ReasoningContent string `json:"reasoning_content,omitempty"` // Some models (e.g., z.ai) use this field
 					} `json:"delta"`
 					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
@@ -648,6 +721,15 @@ func (p *AnthropicProvider) SupportsStreaming() bool {
 
 // ChatStream streams tokens from Anthropic API
 func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []ChatMessage, opts ChatOptions, onToken TokenCallback) (string, error) {
+	release, err := AcquireLLMSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	if release != nil {
+		defer release()
+	}
+
+	opts = normalizeChatOptions(opts)
 	model := opts.Model
 	if model == "" {
 		model = p.model
@@ -780,6 +862,15 @@ func (p *OllamaProvider) SupportsStreaming() bool {
 
 // ChatStream streams tokens from Ollama API (NDJSON format)
 func (p *OllamaProvider) ChatStream(ctx context.Context, messages []ChatMessage, opts ChatOptions, onToken TokenCallback) (string, error) {
+	release, err := AcquireLLMSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	if release != nil {
+		defer release()
+	}
+
+	opts = normalizeChatOptions(opts)
 	model := opts.Model
 	if model == "" {
 		model = p.model
@@ -838,7 +929,8 @@ func parseOllamaNDJSON(reader io.Reader, onToken TokenCallback) (string, error) 
 
 		var chunk struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content,omitempty"` // Some models (e.g., z.ai) use this field
 			} `json:"message"`
 			Done bool `json:"done"`
 		}

@@ -28,6 +28,9 @@ type Config struct {
 
 	// Concurrency control
 	MaxConcurrentLLMRequests int // Maximum concurrent LLM API requests (0 = unlimited)
+
+	// LLM request limits
+	MaxTokensCap int // Max tokens allowed in a single LLM request (0 = default cap)
 }
 
 // Validation bounds for timeout values
@@ -42,6 +45,8 @@ const (
 	// Concurrency limits
 	defaultMaxConcurrentLLMRequests = 2  // Default: allow 2 concurrent LLM requests
 	maxConcurrentLLMRequests        = 20 // Hard cap to prevent abuse
+
+	defaultMaxTokensCap = 8192
 )
 
 // DefaultConfig returns default configuration values
@@ -58,6 +63,7 @@ func DefaultConfig() *Config {
 		CodeExecTimeout:          10 * time.Second,
 		WebFetchTimeout:          15 * time.Second,
 		MaxConcurrentLLMRequests: defaultMaxConcurrentLLMRequests,
+		MaxTokensCap:             defaultMaxTokensCap,
 	}
 }
 
@@ -192,6 +198,22 @@ func LoadConfig() *Config {
 				log.Printf("[CONFIG] LLM_MAX_CONCURRENT (%d) exceeds maximum (%d), clamping", n, maxConcurrentLLMRequests)
 			} else {
 				cfg.MaxConcurrentLLMRequests = n
+			}
+		}
+	}
+
+	// Max tokens cap (per request)
+	if v := os.Getenv("LLM_MAX_TOKENS_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			switch {
+			case n < minTokensCap:
+				cfg.MaxTokensCap = minTokensCap
+				log.Printf("[CONFIG] LLM_MAX_TOKENS_CAP (%d) below minimum (%d), clamping", n, minTokensCap)
+			case n > maxTokensCap:
+				cfg.MaxTokensCap = maxTokensCap
+				log.Printf("[CONFIG] LLM_MAX_TOKENS_CAP (%d) exceeds maximum (%d), clamping", n, maxTokensCap)
+			default:
+				cfg.MaxTokensCap = n
 			}
 		}
 	}

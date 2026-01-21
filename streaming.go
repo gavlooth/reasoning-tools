@@ -702,6 +702,7 @@ func determineStreamMode(args map[string]interface{}) StreamMode {
 		if mode == StreamModeNone && modeStr != "" && modeStr != "none" {
 			// Invalid stream_mode value was provided - log but still use default
 			// This allows the function to continue gracefully while alerting to configuration issues
+			fmt.Fprintf(os.Stderr, "Warning: Invalid stream_mode value '%s'. Expected 'none', 'events', 'tokens', or 'both'. Using default 'none'.\n", modeStr)
 		}
 		return mode
 	}
@@ -713,7 +714,7 @@ func determineStreamMode(args map[string]interface{}) StreamMode {
 		if shouldShowDeprecationWarnings() {
 			fmt.Fprintf(os.Stderr, "DeprecationWarning: 'stream' parameter will be removed in version 2.0. Please use 'stream_mode' with values 'none', 'events', 'tokens', or 'both' instead.\n")
 		}
-		return StreamModeEvents
+		return StreamModeBoth
 	}
 
 	// 3. Check REASONING_STREAM_MODE environment variable (new granular control)
@@ -727,7 +728,7 @@ func determineStreamMode(args map[string]interface{}) StreamMode {
 		if shouldShowDeprecationWarnings() {
 			fmt.Fprintf(os.Stderr, "DeprecationWarning: 'REASONING_STREAM' environment variable will be removed in version 2.0. Please use 'REASONING_STREAM_MODE' with values 'none', 'events', 'tokens', or 'both' instead.\n")
 		}
-		return StreamModeEvents
+		return StreamModeBoth
 	}
 
 	return StreamModeNone

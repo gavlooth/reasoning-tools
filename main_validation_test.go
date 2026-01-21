@@ -17,30 +17,30 @@ func TestValidateToolNames(t *testing.T) {
 	tests := []struct {
 		name           string
 		toolList       []string
-		expectedValid   []string
-		expectedLogged  string
+		expectedValid  []string
+		expectedLogged string
 	}{
 		{
-			name:          "All valid tools",
-			toolList:      []string{"calculator", "web_fetch"},
+			name:           "All valid tools",
+			toolList:       []string{"calculator", "web_fetch"},
 			expectedValid:  []string{"calculator", "web_fetch"},
 			expectedLogged: "",
 		},
 		{
-			name:          "All invalid tools",
-			toolList:      []string{"invalid1", "invalid2"},
+			name:           "All invalid tools",
+			toolList:       []string{"invalid1", "invalid2"},
 			expectedValid:  []string{},
 			expectedLogged: "ignoring invalid tool name(s)",
 		},
 		{
-			name:          "Mixed valid and invalid",
-			toolList:      []string{"calculator", "invalid", "web_fetch", "unknown"},
+			name:           "Mixed valid and invalid",
+			toolList:       []string{"calculator", "invalid", "web_fetch", "unknown"},
 			expectedValid:  []string{"calculator", "web_fetch"},
 			expectedLogged: "ignoring invalid tool name(s)",
 		},
 		{
-			name:          "Empty tool names",
-			toolList:      []string{"", "calculator"},
+			name:           "Empty tool names",
+			toolList:       []string{"", "calculator"},
 			expectedValid:  []string{"calculator"},
 			expectedLogged: "",
 		},

@@ -8,7 +8,7 @@ An MCP (Model Context Protocol) server that provides advanced reasoning tools us
 ┌─────────────┐      ┌──────────────────────┐      ┌─────────────────┐
 │ Main Client │ ───► │ This MCP Server      │ ───► │ LLM Provider    │
 │ (Claude)    │      │                      │      │ (zai/openai/    │
-└─────────────┘      │ • sequential_think   │      │  groq/deepseek/ │
+└─────────────┘      │ • sequential_thinking │      │  groq/deepseek/ │
                      │ • graph_of_thoughts  │      │  ollama/etc)    │
                      │ • reflexion          │      └─────────────────┘
                      │ • dialectic_reason   │
@@ -23,7 +23,7 @@ An MCP (Model Context Protocol) server that provides advanced reasoning tools us
 
 ## Tools Available
 
-### 1. `sequential_think`
+### 1. `sequential_thinking`
 Simple linear chain-of-thought reasoning. Good for straightforward problems.
 
 ```json
@@ -135,7 +135,7 @@ All reasoning tools support streaming output via the `stream: true` parameter:
 
 | Provider | Env Key | Default Model | Notes |
 |----------|---------|---------------|-------|
-| **zai** (GLM) | `ZAI_API_KEY` | glm-4 | z.ai/Zhipu |
+| **zai** (GLM) | `ZAI_API_KEY` | glm-4.7 | z.ai/Zhipu |
 | **openai** | `OPENAI_API_KEY` | gpt-4o-mini | |
 | **anthropic** | `ANTHROPIC_API_KEY` | claude-3-haiku | |
 | **groq** | `GROQ_API_KEY` | llama-3.1-70b | Very fast |
@@ -170,17 +170,19 @@ export ZAI_BASE_URL="..."            # Custom endpoint for z.ai
 
 ### 3. MCP Configuration
 
+Most MCP desktop/CLI clients use stdio, so pass `-transport=stdio` in their args.
+
 **Codex** (`~/.codex/config.toml`):
 ```toml
 [mcp_servers.reasoning-tools]
 command = "reasoning-tools"
-args = []
+args = ["-transport=stdio"]
 disabled = false
 
 [mcp_servers.reasoning-tools.env]
 ZAI_API_KEY = "your-key"
 ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
-GLM_MODEL = "glm-4"
+GLM_MODEL = "glm-4.7"
 ```
 
 **OpenCode** (`~/.config/opencode/opencode.json`):
@@ -190,6 +192,7 @@ GLM_MODEL = "glm-4"
     "reasoning-tools": {
       "type": "local",
       "command": ["reasoning-tools"],
+      "args": ["-transport=stdio"],
       "environment": {
         "ZAI_API_KEY": "your-key",
         "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
@@ -205,7 +208,7 @@ GLM_MODEL = "glm-4"
   "mcpServers": {
     "reasoning-tools": {
       "command": "reasoning-tools",
-      "args": [],
+      "args": ["-transport=stdio"],
       "env": {
         "ZAI_API_KEY": "your-key",
         "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
@@ -217,7 +220,7 @@ GLM_MODEL = "glm-4"
 
 Or add via CLI:
 ```bash
-claude mcp add reasoning-tools -- reasoning-tools
+claude mcp add reasoning-tools -- reasoning-tools -transport=stdio
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`):
@@ -226,7 +229,7 @@ claude mcp add reasoning-tools -- reasoning-tools
   "mcpServers": {
     "reasoning-tools": {
       "command": "reasoning-tools",
-      "args": [],
+      "args": ["-transport=stdio"],
       "env": {
         "ZAI_API_KEY": "your-key",
         "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
@@ -242,7 +245,7 @@ Or for project-specific config (`.gemini/settings.json`):
   "mcpServers": {
     "reasoning-tools": {
       "command": "reasoning-tools",
-      "args": [],
+      "args": ["-transport=stdio"],
       "env": {
         "ZAI_API_KEY": "your-key",
         "ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"
@@ -250,6 +253,38 @@ Or for project-specific config (`.gemini/settings.json`):
     }
   }
 }
+```
+
+### 4. Transports
+
+This server supports three transports (default: **sse**), plus a dual mode:
+- **stdio** (use `-transport=stdio` for stdio-based clients)
+- **sse** (Server-Sent Events; `/sse` + `/message`)
+- **streamable-http** (single endpoint, default `/mcp`)
+- **dual** (SSE + streamable-http on the same port)
+
+When `-transport` is not provided and stdin/stdout are non-interactive, the server auto-selects **stdio** to support stdio-based MCP clients. Set `-transport` or `MCP_TRANSPORT` to override.
+
+Examples:
+
+```bash
+# SSE
+./reasoning-tools -transport=sse -port=9847 -base-url http://localhost:9847
+
+# Streamable HTTP
+./reasoning-tools -transport=streamable-http -port=9847 -http-path /mcp
+
+# Dual (SSE + Streamable HTTP)
+./reasoning-tools -transport=dual -port=9847 -base-url http://localhost:9847 -http-path /mcp
+```
+
+Environment overrides:
+
+```bash
+export MCP_TRANSPORT=sse
+export MCP_PORT=9847
+export MCP_BASE_URL="http://localhost:9847"   # SSE only
+export MCP_HTTP_PATH="/mcp"                   # Streamable HTTP only
 ```
 
 ## Algorithm Details

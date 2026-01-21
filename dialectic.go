@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -30,6 +32,11 @@ type DialecticConfig struct {
 	VerifyThreshold  float64  // Minimum verification score to accept (default: 0.7)
 	ConfidenceTarget float64  // Stop when synthesis reaches this confidence (default: 0.85)
 	Temperature      float64  // LLM temperature (default: 0.7)
+	MaxTokens        int      // Maximum tokens per LLM call (default: 1024)
+	FastMode         bool     // Run a single-pass dialectic (default: false)
+	ThesisModel      string   // Override model for thesis generation (optional)
+	AntithesisModel  string   // Override model for antithesis generation (optional)
+	SynthesisModel   string   // Override model for synthesis generation (optional)
 	EnableTools      bool     // Whether to use tools during verification (default: false)
 	MaxToolCalls     int      // Maximum tool calls total (default: 10)
 	EnabledTools     []string // Which tools to enable (empty = all)
@@ -42,6 +49,11 @@ func DefaultDialecticConfig() DialecticConfig {
 		VerifyThreshold:  0.7,
 		ConfidenceTarget: 0.85,
 		Temperature:      0.7,
+		MaxTokens:        1024,
+		FastMode:         false,
+		ThesisModel:      "",
+		AntithesisModel:  "",
+		SynthesisModel:   "",
 		EnableTools:      false,
 		MaxToolCalls:     10,
 		EnabledTools:     []string{},
@@ -97,6 +109,13 @@ type DialecticResult struct {
 	Provider       string          `json:"provider"`
 }
 
+type fastPayload struct {
+	Thesis     string  `json:"thesis"`
+	Antithesis string  `json:"antithesis"`
+	Synthesis  string  `json:"synthesis"`
+	Confidence float64 `json:"confidence"`
+}
+
 // NewDialecticalReasoner creates a new dialectical reasoner
 func NewDialecticalReasoner(provider Provider, config DialecticConfig) *DialecticalReasoner {
 	d := &DialecticalReasoner{
@@ -138,6 +157,10 @@ func (d *DialecticalReasoner) emitProgress(update ProgressUpdate) {
 
 // Reason performs dialectical reasoning on a problem
 func (d *DialecticalReasoner) Reason(ctx context.Context, problem string) (*DialecticResult, error) {
+	if d.config.FastMode {
+		return d.reasonFast(ctx, problem)
+	}
+
 	result := &DialecticResult{
 		Problem:   problem,
 		Steps:     []DialecticStep{},
@@ -257,6 +280,244 @@ func (d *DialecticalReasoner) Reason(ctx context.Context, problem string) (*Dial
 	return result, nil
 }
 
+func (d *DialecticalReasoner) reasonFast(ctx context.Context, problem string) (*DialecticResult, error) {
+	result := &DialecticResult{
+		Problem:   problem,
+		Steps:     []DialecticStep{},
+		Provider:  d.provider.Name(),
+		ToolsUsed: make(map[string]int),
+	}
+
+	d.emitProgress(ProgressUpdate{
+		Type:    "thought",
+		Message: "Generating fast dialectic response...",
+	})
+
+	prompt := fmt.Sprintf(`You are a careful dialectical reasoner.
+
+Problem: %s
+
+Provide a concise thesis, antithesis, and synthesis. Respond with ONLY a JSON object:
+{
+  "thesis": "string",
+  "antithesis": "string",
+  "synthesis": "string",
+  "confidence": 0.0
+}
+
+Confidence is your 0-1 confidence in the synthesis. Keep each field concise.
+
+If you cannot produce JSON, respond in plain text using EXACT labels:
+THESIS: ...
+ANTITHESIS: ...
+SYNTHESIS: ...
+CONFIDENCE: 0.0`, problem)
+
+	messages := []ChatMessage{
+		{Role: "system", Content: "You produce clean JSON and concise dialectical analysis."},
+		{Role: "user", Content: prompt},
+	}
+
+	var response string
+	var err error
+	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
+		response, err = sp.ChatStream(ctx, messages, ChatOptions{
+			Temperature: clampTemperature(d.config.Temperature),
+			MaxTokens:   d.config.MaxTokens,
+		}, func(token string) {
+			if d.onToken != nil {
+				d.onToken(token)
+			}
+		})
+	} else {
+		response, err = d.provider.Chat(ctx, messages, ChatOptions{
+			Temperature: clampTemperature(d.config.Temperature),
+			MaxTokens:   d.config.MaxTokens,
+		})
+	}
+	if err != nil {
+		return result, err
+	}
+
+	jsonStr := utils.ExtractJSON(response)
+	var payload fastPayload
+	if jsonStr != "" {
+		if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
+			return result, fmt.Errorf("failed to parse fast dialectic response: %w", err)
+		}
+	} else {
+		var ok bool
+		payload, ok = parseFastDialecticText(response)
+		if !ok {
+			return result, fmt.Errorf("failed to parse fast dialectic response")
+		}
+	}
+
+	confidence := payload.Confidence
+	if confidence < 0 {
+		confidence = 0
+	} else if confidence > 1 {
+		confidence = 1
+	}
+
+	step := DialecticStep{
+		Round: 1,
+		Thesis: Claim{
+			Content: payload.Thesis,
+			Verification: Verification{
+				IsValid: true,
+				Score:   0.5,
+				Status:  StatusSkipped,
+			},
+		},
+		Antithesis: Claim{
+			Content: payload.Antithesis,
+			Verification: Verification{
+				IsValid: true,
+				Score:   0.5,
+				Status:  StatusSkipped,
+			},
+		},
+		Synthesis: Claim{
+			Content: payload.Synthesis,
+			Verification: Verification{
+				IsValid: true,
+				Score:   confidence,
+				Status:  StatusSkipped,
+			},
+		},
+		Resolved: confidence >= d.config.VerifyThreshold,
+	}
+
+	result.Steps = append(result.Steps, step)
+	result.TotalRounds = 1
+	result.FinalAnswer = payload.Synthesis
+	result.Confidence = confidence
+	result.Success = confidence >= d.config.VerifyThreshold
+
+	d.emitProgress(ProgressUpdate{
+		Type:        "solution",
+		Message:     "Fast dialectic response complete",
+		IsSolution:  true,
+		FinalAnswer: result.FinalAnswer,
+	})
+
+	return result, nil
+}
+
+func parseFastDialecticText(response string) (fastPayload, bool) {
+	response = strings.ReplaceAll(response, "\r\n", "\n")
+	response = strings.ReplaceAll(response, "\r", "\n")
+
+	sections := map[string][]string{}
+	current := ""
+
+	normalizeLine := func(line string) string {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "-*• \t")
+		return strings.TrimSpace(line)
+	}
+
+	detectLabel := func(line string) string {
+		lower := strings.ToLower(line)
+		switch {
+		case strings.HasPrefix(lower, "thesis"):
+			return "thesis"
+		case strings.HasPrefix(lower, "antithesis"), strings.HasPrefix(lower, "anti-thesis"):
+			return "antithesis"
+		case strings.HasPrefix(lower, "synthesis"):
+			return "synthesis"
+		case strings.HasPrefix(lower, "confidence"):
+			return "confidence"
+		default:
+			return ""
+		}
+	}
+
+	lines := strings.Split(response, "\n")
+	for _, raw := range lines {
+		line := normalizeLine(raw)
+		if line == "" {
+			continue
+		}
+
+		if label := detectLabel(line); label != "" {
+			remainder := strings.TrimSpace(line[len(label):])
+			remainder = strings.TrimLeft(remainder, ":-–— \t")
+			current = label
+			if remainder != "" {
+				sections[label] = append(sections[label], remainder)
+			}
+			continue
+		}
+
+		if current != "" {
+			sections[current] = append(sections[current], line)
+		}
+	}
+
+	clean := func(parts []string) string {
+		if len(parts) == 0 {
+			return ""
+		}
+		combined := strings.Join(parts, " ")
+		combined = strings.TrimSpace(combined)
+		if strings.HasPrefix(combined, "1.") || strings.HasPrefix(combined, "2.") || strings.HasPrefix(combined, "3.") {
+			combined = strings.TrimSpace(strings.TrimLeft(combined[2:], " "))
+		}
+		return strings.TrimSpace(combined)
+	}
+
+	thesis := clean(sections["thesis"])
+	antithesis := clean(sections["antithesis"])
+	synthesis := clean(sections["synthesis"])
+
+	confidence := 0.0
+	confText := clean(sections["confidence"])
+	if confText == "" {
+		confText = response
+	}
+	confRe := regexp.MustCompile(`(?is)(?:^|\n)\s*confidence\s*[:\-]?\s*([0-9]*\.?[0-9]+)`)
+	if match := confRe.FindStringSubmatch(confText); len(match) > 1 {
+		if val, err := strconv.ParseFloat(match[1], 64); err == nil {
+			confidence = val
+		}
+	}
+
+	if thesis == "" || antithesis == "" || synthesis == "" {
+		var fallback []string
+		for _, raw := range lines {
+			line := normalizeLine(raw)
+			if line == "" {
+				continue
+			}
+			fallback = append(fallback, line)
+		}
+		if len(fallback) >= 3 {
+			if thesis == "" {
+				thesis = fallback[0]
+			}
+			if antithesis == "" {
+				antithesis = fallback[1]
+			}
+			if synthesis == "" {
+				synthesis = fallback[2]
+			}
+		}
+	}
+
+	if thesis == "" || antithesis == "" || synthesis == "" {
+		return fastPayload{}, false
+	}
+
+	return fastPayload{
+		Thesis:     thesis,
+		Antithesis: antithesis,
+		Synthesis:  synthesis,
+		Confidence: confidence,
+	}, true
+}
+
 // countToolsUsed counts which tools were used
 func (d *DialecticalReasoner) countToolsUsed(result *DialecticResult) {
 	for _, step := range result.Steps {
@@ -305,8 +566,9 @@ Respond with just your thesis, no preamble.`, problem, context, lastSynthesis)
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		return sp.ChatStream(ctx, messages, ChatOptions{
-			Temperature: d.config.Temperature,
-			MaxTokens:   1024,
+			Temperature: clampTemperature(d.config.Temperature),
+			MaxTokens:   d.config.MaxTokens,
+			Model:       d.config.ThesisModel,
 		}, func(token string) {
 			if d.onToken != nil {
 				d.onToken(token)
@@ -315,8 +577,9 @@ Respond with just your thesis, no preamble.`, problem, context, lastSynthesis)
 	}
 
 	return d.provider.Chat(ctx, messages, ChatOptions{
-		Temperature: d.config.Temperature,
-		MaxTokens:   1024,
+		Temperature: clampTemperature(d.config.Temperature),
+		MaxTokens:   d.config.MaxTokens,
+		Model:       d.config.ThesisModel,
 	})
 }
 
@@ -352,8 +615,9 @@ Respond with just your antithesis, no preamble.`, problem, thesis, issuesContext
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		return sp.ChatStream(ctx, messages, ChatOptions{
-			Temperature: d.config.Temperature + 0.1, // Slightly higher for creativity
-			MaxTokens:   1024,
+			Temperature: clampTemperature(d.config.Temperature + 0.1), // Slightly higher for creativity
+			MaxTokens:   d.config.MaxTokens,
+			Model:       d.config.AntithesisModel,
 		}, func(token string) {
 			if d.onToken != nil {
 				d.onToken(token)
@@ -362,8 +626,9 @@ Respond with just your antithesis, no preamble.`, problem, thesis, issuesContext
 	}
 
 	return d.provider.Chat(ctx, messages, ChatOptions{
-		Temperature: d.config.Temperature + 0.1, // Slightly higher for creativity
-		MaxTokens:   1024,
+		Temperature: clampTemperature(d.config.Temperature + 0.1), // Slightly higher for creativity
+		MaxTokens:   d.config.MaxTokens,
+		Model:       d.config.AntithesisModel,
 	})
 }
 
@@ -410,8 +675,9 @@ Respond with just your synthesis, no preamble.`,
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		return sp.ChatStream(ctx, messages, ChatOptions{
-			Temperature: d.config.Temperature - 0.1, // Slightly lower for precision
-			MaxTokens:   1500,
+			Temperature: clampTemperature(d.config.Temperature - 0.1), // Slightly lower for precision
+			MaxTokens:   d.config.MaxTokens,
+			Model:       d.config.SynthesisModel,
 		}, func(token string) {
 			if d.onToken != nil {
 				d.onToken(token)
@@ -420,8 +686,9 @@ Respond with just your synthesis, no preamble.`,
 	}
 
 	return d.provider.Chat(ctx, messages, ChatOptions{
-		Temperature: d.config.Temperature - 0.1, // Slightly lower for precision
-		MaxTokens:   1500,
+		Temperature: clampTemperature(d.config.Temperature - 0.1), // Slightly lower for precision
+		MaxTokens:   d.config.MaxTokens,
+		Model:       d.config.SynthesisModel,
 	})
 }
 
@@ -482,8 +749,8 @@ Be thorough but fair. Look for:
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		response, err = sp.ChatStream(ctx, messages, ChatOptions{
-			Temperature: 0.3, // Low temp for consistent verification
-			MaxTokens:   1024,
+			Temperature: clampTemperature(0.3), // Low temp for consistent verification
+			MaxTokens:   d.config.MaxTokens,
 		}, func(token string) {
 			if d.onToken != nil {
 				d.onToken(token)
@@ -491,8 +758,8 @@ Be thorough but fair. Look for:
 		})
 	} else {
 		response, err = d.provider.Chat(ctx, messages, ChatOptions{
-			Temperature: 0.3, // Low temp for consistent verification
-			MaxTokens:   1024,
+			Temperature: clampTemperature(0.3), // Low temp for consistent verification
+			MaxTokens:   d.config.MaxTokens,
 		})
 	}
 	if err != nil {
@@ -535,8 +802,8 @@ Only suggest tools if they would genuinely help verify the claim. Respond with [
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		response, err = sp.ChatStream(ctx, messages, ChatOptions{
-			Temperature: 0.3,
-			MaxTokens:   512,
+			Temperature: clampTemperature(0.3),
+			MaxTokens:   d.config.MaxTokens,
 		}, func(token string) {
 			if d.onToken != nil {
 				d.onToken(token)
@@ -544,8 +811,8 @@ Only suggest tools if they would genuinely help verify the claim. Respond with [
 		})
 	} else {
 		response, err = d.provider.Chat(ctx, messages, ChatOptions{
-			Temperature: 0.3,
-			MaxTokens:   512,
+			Temperature: clampTemperature(0.3),
+			MaxTokens:   d.config.MaxTokens,
 		})
 	}
 	if err != nil {
@@ -616,29 +883,114 @@ func (d *DialecticalReasoner) buildContext(steps []DialecticStep) string {
 // parseVerification extracts verification from LLM response
 func parseVerification(response string) (Verification, error) {
 	jsonStr := utils.ExtractJSON(response)
-	if jsonStr == "" {
-		return Verification{IsValid: false, Score: 0, Status: StatusUnverified, ErrorReason: "no JSON in response"}, fmt.Errorf("no JSON in response")
+	if jsonStr != "" {
+		// Successfully extracted JSON
+		var v Verification
+		if err := json.Unmarshal([]byte(jsonStr), &v); err != nil {
+			return Verification{IsValid: false, Score: 0, Status: StatusUnverified, ErrorReason: fmt.Sprintf("JSON parse error: %v", err)}, err
+		}
+
+		// Set status to verified for successful verifications
+		if v.Status == "" {
+			v.Status = StatusVerified
+		}
+
+		// Clamp score
+		if v.Score < 0 {
+			v.Score = 0
+		}
+		if v.Score > 1 {
+			v.Score = 1
+		}
+
+		return v, nil
 	}
 
-	var v Verification
-	if err := json.Unmarshal([]byte(jsonStr), &v); err != nil {
-		return Verification{IsValid: false, Score: 0, Status: StatusUnverified, ErrorReason: fmt.Sprintf("JSON parse error: %v", err)}, err
-	}
+	// No JSON found - try to parse text response and convert to Verification
+	// This handles z.ai (glm-4.7) which often returns plain text instead of JSON
+	v := parseTextToVerification(response)
 
-	// Set status to verified for successful verifications
+	// Set status since text parser doesn't set it
 	if v.Status == "" {
 		v.Status = StatusVerified
 	}
 
-	// Clamp score
-	if v.Score < 0 {
-		v.Score = 0
-	}
-	if v.Score > 1 {
-		v.Score = 1
+	return v, nil
+}
+
+// parseTextToVerification attempts to convert a plain text response into a Verification object
+// This is a fallback for providers (like z.ai's glm-4.7) that don't always return JSON
+func parseTextToVerification(text string) Verification {
+	textLower := strings.ToLower(text)
+
+	v := Verification{
+		Issues:      []string{},
+		Strengths:   []string{},
+		Suggestion:  "",
+		ErrorReason: "Parsed from text response (no JSON provided)",
 	}
 
-	return v, nil
+	// Look for explicit validity indicators
+	if strings.Contains(textLower, "is_valid: true") || strings.Contains(textLower, "\"is_valid\":true") {
+		v.IsValid = true
+	} else if strings.Contains(textLower, "is_valid: false") || strings.Contains(textLower, "\"is_valid\":false") {
+		v.IsValid = false
+	} else {
+		// Default: assume valid if no explicit issues found
+		v.IsValid = true
+	}
+
+	// Extract score if present
+	scorePattern := regexp.MustCompile(`score["\s:=]*["\s=:]*(\d+\.?\d*)`)
+	if match := scorePattern.FindStringSubmatch(text); len(match) > 1 {
+		if score, err := strconv.ParseFloat(match[1], 64); err == nil {
+			v.Score = score
+		}
+	}
+	if v.Score == 0 {
+		// Default score based on validity
+		if v.IsValid {
+			v.Score = 0.8 // Default to 0.8 if valid
+		} else {
+			v.Score = 0.2 // Default to 0.2 if invalid
+		}
+	}
+
+	// Look for issues in text
+	issuePatterns := []string{
+		"issue",
+		"problem",
+		"weakness",
+		"gap",
+		"flaw",
+		"error",
+		"incorrect",
+		"missing",
+		"concern",
+	}
+	for _, pattern := range issuePatterns {
+		if strings.Contains(textLower, pattern) {
+			// Try to extract specific issues mentioned
+			// For now, just note that issues were found
+			v.Issues = append(v.Issues, "Response mentioned issues: "+pattern)
+			break
+		}
+	}
+
+	// Look for strengths in text
+	if !v.IsValid || len(v.Issues) == 0 {
+		v.Strengths = append(v.Strengths, "Response provided analysis")
+	} else {
+		strengthPatterns := []string{"good", "strong", "valid", "correct", "solid"}
+		for _, pattern := range strengthPatterns {
+			if strings.Contains(textLower, pattern) {
+				v.Strengths = append(v.Strengths, "Response noted positive aspects")
+				break
+			}
+		}
+	}
+	return v
+
 }
 
 // FormatDialecticResult formats the result for display
