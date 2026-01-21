@@ -537,25 +537,25 @@ func (d *DialecticalReasoner) countToolsUsed(result *DialecticResult) {
 func (d *DialecticalReasoner) generateThesis(ctx context.Context, problem, context, lastSynthesis string) (string, error) {
 	var prompt string
 	if lastSynthesis == "" {
-		prompt = fmt.Sprintf(`You are a thoughtful reasoner. Propose a clear, well-reasoned solution to this problem.
+		prompt = fmt.Sprintf(`Problem: %s
 
-Problem: %s
+Propose a clear thesis (claim or solution). Be specific and concise.
 
-Provide your thesis - a clear claim or solution approach. Be specific and justify your reasoning.
-Respond with just your thesis, no preamble.`, problem)
+IMPORTANT: Output ONLY your thesis statement. Do NOT include:
+- Numbered analysis steps
+- "Let me think..." or similar phrases
+- Bullet points breaking down the problem
+- Meta-commentary about your reasoning process
+
+Your response should be 1-3 sentences containing just the thesis itself.`, problem)
 	} else {
-		prompt = fmt.Sprintf(`You are a thoughtful reasoner building on previous analysis.
+		prompt = fmt.Sprintf(`Problem: %s
 
-Problem: %s
+Previous synthesis: %s
 
-Previous context:
-%s
+Propose a refined thesis that advances the reasoning.
 
-Last synthesis to build upon:
-%s
-
-Propose a refined thesis that advances the reasoning. Address any remaining uncertainties.
-Respond with just your thesis, no preamble.`, problem, context, lastSynthesis)
+IMPORTANT: Output ONLY your thesis statement (1-3 sentences). No analysis steps, no meta-commentary.`, problem, lastSynthesis)
 	}
 
 	messages := []ChatMessage{
@@ -565,7 +565,7 @@ Respond with just your thesis, no preamble.`, problem, context, lastSynthesis)
 
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
-		return sp.ChatStream(ctx, messages, ChatOptions{
+		result, err := sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: clampTemperature(d.config.Temperature),
 			MaxTokens:   d.config.MaxTokens,
 			Model:       d.config.ThesisModel,
@@ -574,38 +574,36 @@ Respond with just your thesis, no preamble.`, problem, context, lastSynthesis)
 				d.onToken(token)
 			}
 		})
+		return utils.StripChainOfThought(result), err
 	}
 
-	return d.provider.Chat(ctx, messages, ChatOptions{
+	result, err := d.provider.Chat(ctx, messages, ChatOptions{
 		Temperature: clampTemperature(d.config.Temperature),
 		MaxTokens:   d.config.MaxTokens,
 		Model:       d.config.ThesisModel,
 	})
+	return utils.StripChainOfThought(result), err
 }
 
 // generateAntithesis challenges the thesis
 func (d *DialecticalReasoner) generateAntithesis(ctx context.Context, problem, thesis string, thesisVerification Verification) (string, error) {
 	issuesContext := ""
 	if len(thesisVerification.Issues) > 0 {
-		issuesContext = fmt.Sprintf("\n\nKnown issues with the thesis:\n- %s", strings.Join(thesisVerification.Issues, "\n- "))
+		issuesContext = fmt.Sprintf("\nKnown issues: %s", strings.Join(thesisVerification.Issues, "; "))
 	}
 
-	prompt := fmt.Sprintf(`You are a critical challenger. Your job is to find flaws and argue against the thesis.
+	prompt := fmt.Sprintf(`Problem: %s
 
-Problem: %s
+Thesis: %s%s
 
-Thesis to challenge:
-%s
-%s
+Challenge this thesis with a strong counterargument. Identify weaknesses or alternative perspectives.
 
-Generate a strong antithesis that:
-1. Identifies weaknesses, assumptions, or gaps in the thesis
-2. Proposes alternative perspectives or counterarguments
-3. Challenges any unjustified claims
-4. Points out edge cases or failure modes
+IMPORTANT: Output ONLY your antithesis statement (1-3 sentences). Do NOT include:
+- Numbered analysis steps like "1. Analyze..." or "**Step 1:**"
+- Meta-commentary about your reasoning process
+- Bullet points breaking down the problem
 
-Be rigorous but fair. Don't strawman - engage with the strongest version of the thesis.
-Respond with just your antithesis, no preamble.`, problem, thesis, issuesContext)
+Just state your counterargument directly.`, problem, thesis, issuesContext)
 
 	messages := []ChatMessage{
 		{Role: "system", Content: "You are a devil's advocate. Challenge ideas rigorously but fairly. Find real flaws, not nitpicks."},
@@ -614,7 +612,7 @@ Respond with just your antithesis, no preamble.`, problem, thesis, issuesContext
 
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
-		return sp.ChatStream(ctx, messages, ChatOptions{
+		result, err := sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: clampTemperature(d.config.Temperature + 0.1), // Slightly higher for creativity
 			MaxTokens:   d.config.MaxTokens,
 			Model:       d.config.AntithesisModel,
@@ -623,49 +621,34 @@ Respond with just your antithesis, no preamble.`, problem, thesis, issuesContext
 				d.onToken(token)
 			}
 		})
+		return utils.StripChainOfThought(result), err
 	}
 
-	return d.provider.Chat(ctx, messages, ChatOptions{
+	result, err := d.provider.Chat(ctx, messages, ChatOptions{
 		Temperature: clampTemperature(d.config.Temperature + 0.1), // Slightly higher for creativity
 		MaxTokens:   d.config.MaxTokens,
 		Model:       d.config.AntithesisModel,
 	})
+	return utils.StripChainOfThought(result), err
 }
 
 // generateSynthesis resolves thesis and antithesis
 func (d *DialecticalReasoner) generateSynthesis(ctx context.Context, problem string, thesis, antithesis Claim) (string, error) {
-	prompt := fmt.Sprintf(`You are a wise synthesizer. Resolve the debate between thesis and antithesis.
+	prompt := fmt.Sprintf(`Problem: %s
 
-Problem: %s
+THESIS: %s
 
-THESIS (confidence: %.2f):
-%s
+ANTITHESIS: %s
 
-Thesis strengths: %s
-Thesis issues: %s
+Synthesize these positions into a balanced conclusion that integrates valid points from both sides.
 
-ANTITHESIS (confidence: %.2f):
-%s
+IMPORTANT: Output ONLY your synthesis statement (2-4 sentences). Do NOT include:
+- Numbered analysis steps like "1. Analyze..." or "**Step 1:**"
+- Meta-commentary or reasoning process
+- Bullet points breaking down the argument
 
-Antithesis strengths: %s
-Antithesis issues: %s
-
-Generate a synthesis that:
-1. Acknowledges valid points from both sides
-2. Resolves contradictions through deeper understanding
-3. Integrates the strongest elements of each position
-4. Addresses the issues raised by both verifications
-5. Provides a more complete answer than either alone
-
-If one side is clearly correct, explain why while acknowledging what the other side got right.
-Respond with just your synthesis, no preamble.`,
-		problem,
-		thesis.Verification.Score, thesis.Content,
-		strings.Join(thesis.Verification.Strengths, "; "),
-		strings.Join(thesis.Verification.Issues, "; "),
-		antithesis.Verification.Score, antithesis.Content,
-		strings.Join(antithesis.Verification.Strengths, "; "),
-		strings.Join(antithesis.Verification.Issues, "; "))
+Just provide your synthesized conclusion directly.`,
+		problem, thesis.Content, antithesis.Content)
 
 	messages := []ChatMessage{
 		{Role: "system", Content: "You are a balanced synthesizer. Find truth by integrating opposing views. Produce clear, actionable conclusions."},
@@ -674,7 +657,7 @@ Respond with just your synthesis, no preamble.`,
 
 	// Check if provider supports streaming
 	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
-		return sp.ChatStream(ctx, messages, ChatOptions{
+		result, err := sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: clampTemperature(d.config.Temperature - 0.1), // Slightly lower for precision
 			MaxTokens:   d.config.MaxTokens,
 			Model:       d.config.SynthesisModel,
@@ -683,13 +666,15 @@ Respond with just your synthesis, no preamble.`,
 				d.onToken(token)
 			}
 		})
+		return utils.StripChainOfThought(result), err
 	}
 
-	return d.provider.Chat(ctx, messages, ChatOptions{
+	result, err := d.provider.Chat(ctx, messages, ChatOptions{
 		Temperature: clampTemperature(d.config.Temperature - 0.1), // Slightly lower for precision
 		MaxTokens:   d.config.MaxTokens,
 		Model:       d.config.SynthesisModel,
 	})
+	return utils.StripChainOfThought(result), err
 }
 
 // verify checks if a claim is valid and identifies issues

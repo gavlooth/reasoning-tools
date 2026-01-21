@@ -267,13 +267,23 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 	}
 
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	retryCfg := defaultRetryConfig()
+	rateLimitHits := 0
+
+	for attempt := 0; attempt < retryCfg.maxAttempts+retryCfg.rateLimitAttempts; attempt++ {
 		if attempt > 0 {
+			// Use exponential backoff
+			delay := calculateBackoff(attempt-1, retryCfg)
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-time.After(delay):
 			}
+		}
+
+		// Check if we've exceeded normal retries and only rate limit retries remain
+		if attempt >= retryCfg.maxAttempts && rateLimitHits == 0 {
+			break // No more retries unless we hit rate limits
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
@@ -311,7 +321,14 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				rateLimitHits++
+				lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+				// Close response body before retrying
+				resp.Body.Close()
+				continue
+			}
+			if resp.StatusCode >= 500 {
 				lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 				// Close response body before retrying
 				resp.Body.Close()
@@ -392,6 +409,34 @@ func isTransientError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// retryConfig holds retry settings for API calls
+type retryConfig struct {
+	maxAttempts       int           // Maximum number of attempts
+	baseDelay         time.Duration // Base delay for exponential backoff
+	maxDelay          time.Duration // Maximum delay cap
+	rateLimitAttempts int           // Extra attempts for rate limit errors
+}
+
+// defaultRetryConfig returns default retry settings
+func defaultRetryConfig() retryConfig {
+	return retryConfig{
+		maxAttempts:       3,
+		baseDelay:         2 * time.Second,
+		maxDelay:          30 * time.Second,
+		rateLimitAttempts: 5, // More attempts for rate limits
+	}
+}
+
+// calculateBackoff returns the backoff duration for the given attempt.
+// Uses exponential backoff: baseDelay * 2^attempt, capped at maxDelay.
+func calculateBackoff(attempt int, cfg retryConfig) time.Duration {
+	delay := cfg.baseDelay * time.Duration(1<<uint(attempt)) // 2^attempt
+	if delay > cfg.maxDelay {
+		delay = cfg.maxDelay
+	}
+	return delay
 }
 
 // ============ Anthropic Provider ============
@@ -628,34 +673,71 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []ChatMessage,
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
+	var lastErr error
+	retryCfg := defaultRetryConfig()
+	rateLimitHits := 0
 
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	for k, v := range p.headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", fmt.Errorf("API error (status %d): failed to read response body: %w", resp.StatusCode, err)
+	for attempt := 0; attempt < retryCfg.maxAttempts+retryCfg.rateLimitAttempts; attempt++ {
+		if attempt > 0 {
+			delay := calculateBackoff(attempt-1, retryCfg)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(delay):
+			}
 		}
-		return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+
+		if attempt >= retryCfg.maxAttempts && rateLimitHits == 0 {
+			break
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
+		if err != nil {
+			return "", fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		if p.apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		}
+		for k, v := range p.headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := p.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if isTransientError(err) {
+				continue
+			}
+			return "", fmt.Errorf("request failed: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				lastErr = fmt.Errorf("API error (status %d): failed to read response body: %w", resp.StatusCode, readErr)
+				continue
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				rateLimitHits++
+				lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+				continue
+			}
+			if resp.StatusCode >= 500 {
+				lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+				continue
+			}
+			return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		}
+
+		result, parseErr := parseOpenAISSE(resp.Body, onToken)
+		resp.Body.Close()
+		return result, parseErr
 	}
 
-	return parseOpenAISSE(resp.Body, onToken)
+	return "", fmt.Errorf("request failed after retries: %w", lastErr)
 }
 
 // parseOpenAISSE parses OpenAI-style SSE stream
