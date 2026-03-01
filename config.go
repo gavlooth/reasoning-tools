@@ -46,6 +46,7 @@ const (
 	defaultMaxConcurrentLLMRequests = 2  // Default: allow 2 concurrent LLM requests
 	maxConcurrentLLMRequests        = 20 // Hard cap to prevent abuse
 
+	// Token limits
 	defaultMaxTokensCap = 8192
 )
 
@@ -115,10 +116,18 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// LoadConfig loads configuration from environment variables
+// LoadConfig loads configuration from config file and environment variables.
+// Priority: defaults < config file < environment variables
 // Falls back to defaults if not set. Invalid values are clamped to safe ranges.
 func LoadConfig() *Config {
 	cfg := DefaultConfig()
+
+	// Load from config file first (if exists)
+	fileConfig, configPath := GetFileConfig()
+	if configPath != "" {
+		fileConfig.ApplyToConfig(cfg)
+		log.Printf("[CONFIG] Applied settings from %s", configPath)
+	}
 
 	// clampDuration ensures a duration is within [min, max] and logs if clamped
 	clampDuration := func(name string, value, minVal, maxVal time.Duration) time.Duration {

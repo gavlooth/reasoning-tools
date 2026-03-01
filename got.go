@@ -17,17 +17,54 @@ import (
 
 // GraphOfThoughts implements reasoning as a graph where thoughts can merge
 type GraphOfThoughts struct {
-	provider      Provider
-	config        GoTConfig
-	tools         *ToolRegistry
-	nodes         map[string]*GoTNode
-	nodesMu       sync.RWMutex
-	totalVisits   int
-	toolCalls     int
-	toolCallsMu   sync.Mutex
-	onProgress    func(ProgressUpdate)
-	onToken       func(token string)
-	enableStreams bool
+	provider           Provider
+	thoughtProvider    Provider // Provider for generating thoughts (creative, diverse)
+	evaluationProvider Provider // Provider for scoring thoughts (analytical, precise)
+	mergeProvider      Provider // Provider for merging paths (synthesis)
+	config             GoTConfig
+	tools              *ToolRegistry
+	nodes              map[string]*GoTNode
+	nodesMu            sync.RWMutex
+	totalVisits        int
+	toolCalls          int
+	toolCallsMu        sync.Mutex
+	onProgress         func(ProgressUpdate)
+	onToken            func(token string)
+	enableStreams      bool
+}
+
+// SetThoughtProvider sets a specific provider for thought generation
+func (g *GraphOfThoughts) SetThoughtProvider(p Provider) {
+	g.thoughtProvider = p
+}
+
+// SetEvaluationProvider sets a specific provider for evaluation
+func (g *GraphOfThoughts) SetEvaluationProvider(p Provider) {
+	g.evaluationProvider = p
+}
+
+// SetMergeProvider sets a specific provider for merging
+func (g *GraphOfThoughts) SetMergeProvider(p Provider) {
+	g.mergeProvider = p
+}
+
+// getProviderFor returns the appropriate provider for a given operation
+func (g *GraphOfThoughts) getProviderFor(operation string) Provider {
+	switch operation {
+	case "thought":
+		if g.thoughtProvider != nil {
+			return g.thoughtProvider
+		}
+	case "evaluation":
+		if g.evaluationProvider != nil {
+			return g.evaluationProvider
+		}
+	case "merge":
+		if g.mergeProvider != nil {
+			return g.mergeProvider
+		}
+	}
+	return g.provider
 }
 
 // SetTokenCallback sets a callback for token streaming
@@ -473,8 +510,11 @@ Respond with ONLY a JSON array of strings:
 	var response string
 	var err error
 
+	// Use thought provider for generating thoughts
+	provider := g.getProviderFor("thought")
+
 	// Use streaming if available and enabled
-	if sp, ok := g.provider.(StreamingProvider); ok && g.enableStreams && sp.SupportsStreaming() {
+	if sp, ok := provider.(StreamingProvider); ok && g.enableStreams && sp.SupportsStreaming() {
 		response, err = sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: g.config.Temperature,
 			MaxTokens:   2048,
@@ -484,7 +524,7 @@ Respond with ONLY a JSON array of strings:
 			}
 		})
 	} else {
-		response, err = g.provider.Chat(ctx, messages, ChatOptions{
+		response, err = provider.Chat(ctx, messages, ChatOptions{
 			Temperature: g.config.Temperature,
 			MaxTokens:   2048,
 		})
@@ -582,21 +622,26 @@ func (g *GraphOfThoughts) findMergeCandidate(ctx context.Context, thought string
 	return nil
 }
 
-// checkSimilarity asks LLM if two thoughts are semantically similar
+// checkSimilarity asks LLM to score how similar two thoughts are
 func (g *GraphOfThoughts) checkSimilarity(ctx context.Context, thought1, thought2 string) (bool, error) {
-	prompt := fmt.Sprintf(`Are these two reasoning steps essentially expressing the same idea or reaching the same conclusion?
+	prompt := fmt.Sprintf(`Rate the semantic similarity of these two reasoning steps on a scale from 0.0 to 1.0.
+0.0 = completely different ideas
+1.0 = essentially the same idea or conclusion
 
 Thought 1: %s
 
 Thought 2: %s
 
-Respond with ONLY "yes" or "no".`, thought1, thought2)
+Respond with ONLY a decimal number between 0.0 and 1.0.`, thought1, thought2)
 
 	messages := []ChatMessage{
 		{Role: "user", Content: prompt},
 	}
 
-	response, err := g.provider.Chat(ctx, messages, ChatOptions{
+	// Use merge provider for similarity checking
+	provider := g.getProviderFor("merge")
+
+	response, err := provider.Chat(ctx, messages, ChatOptions{
 		Temperature: 0.1,
 		MaxTokens:   10,
 	})
@@ -604,7 +649,20 @@ Respond with ONLY "yes" or "no".`, thought1, thought2)
 		return false, err
 	}
 
-	return strings.ToLower(strings.TrimSpace(response)) == "yes", nil
+	// Parse similarity score
+	response = strings.TrimSpace(response)
+	score, err := strconv.ParseFloat(response, 64)
+	if err != nil {
+		// Fallback: check for yes/no for backwards compatibility
+		lower := strings.ToLower(response)
+		if lower == "yes" {
+			return true, nil
+		}
+		return false, nil
+	}
+
+	// Compare against configured threshold
+	return score >= g.config.MergeThreshold, nil
 }
 
 // mergeIntoNode merges a new thought into an existing node
@@ -675,7 +733,10 @@ Respond with ONLY a JSON object:
 		{Role: "user", Content: prompt},
 	}
 
-	response, err := g.provider.Chat(ctx, messages, ChatOptions{
+	// Use evaluation provider for scoring
+	provider := g.getProviderFor("evaluation")
+
+	response, err := provider.Chat(ctx, messages, ChatOptions{
 		Temperature: 0.3,
 		MaxTokens:   512,
 	})

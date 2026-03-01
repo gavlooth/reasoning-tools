@@ -1,6 +1,15 @@
-# Reasoning Tools MCP Server v3.2
+# Reasoning Tools MCP Server v3.3
 
 An MCP (Model Context Protocol) server that provides advanced reasoning tools using configurable LLM backends.
+
+## What's New in v3.3
+
+- **Auto-Reasoning**: New `auto_reason` tool automatically selects the best algorithm for your problem
+- **Provider Intelligence**: Tracks provider metrics, scores, and smart fallback
+- **YAML Configuration**: Configure defaults via `reasoning-tools.yaml` file
+- **Enhanced Reflexion Memory**: Uses semantic similarity for finding relevant past lessons
+- **Better Error Handling**: Categorized errors (config/transient/terminal) with smart retry
+- **Configurable GoT Merging**: Similarity threshold for path merging is now configurable
 
 ## Architecture
 
@@ -8,22 +17,52 @@ An MCP (Model Context Protocol) server that provides advanced reasoning tools us
 ┌─────────────┐      ┌──────────────────────┐      ┌─────────────────┐
 │ Main Client │ ───► │ This MCP Server      │ ───► │ LLM Provider    │
 │ (Claude)    │      │                      │      │ (zai/openai/    │
-└─────────────┘      │ • sequential_thinking │      │  groq/deepseek/ │
-                     │ • graph_of_thoughts  │      │  ollama/etc)    │
-                     │ • reflexion          │      └─────────────────┘
-                     │ • dialectic_reason   │
-                     │ • list_providers     │      ┌─────────────────┐
-                     │ • memory_stats       │ ───► │ Built-in Tools  │
-                     └──────────────────────┘      │ • calculator    │
-                                                   │ • code_exec     │
-                                                   │ • web_fetch     │
-                                                   │ • string_ops    │
-                                                   └─────────────────┘
+└─────────────┘      │ • auto_reason (NEW!) │      │  groq/deepseek/ │
+                     │ • sequential_thinking │      │  ollama/etc)    │
+                     │ • graph_of_thoughts  │      └─────────────────┘
+                     │ • reflexion          │           │
+                     │ • dialectic_reason   │    ┌──────┴──────┐
+                     │ • list_providers     │    │ Provider    │
+                     │ • memory_stats       │    │ Intelligence│
+                     └──────────────────────┘    └─────────────┘
+                            │
+                     ┌──────┴──────┐      ┌─────────────────┐
+                     │ YAML Config │      │ Built-in Tools  │
+                     │ (optional)  │      │ • calculator    │
+                     └─────────────┘      │ • code_exec     │
+                                          │ • web_fetch     │
+                                          │ • string_ops    │
+                                          └─────────────────┘
 ```
 
 ## Tools Available
 
-### 1. `sequential_thinking`
+### 1. `auto_reason` (NEW in v3.3)
+Automatically selects and runs the best reasoning algorithm for your problem. Uses either quick heuristic-based selection or LLM-powered analysis to choose between sequential, graph-of-thoughts, reflexion, or dialectic reasoning.
+
+```json
+{
+  "problem": "What are the pros and cons of microservices vs monoliths?",
+  "quick_select": false
+}
+```
+
+**Key Features:**
+- **Quick Select Mode**: Fast keyword-based selection using patterns (debate→dialectic, puzzle→reflexion, brainstorm→GoT)
+- **LLM Analysis Mode**: Deep problem analysis considering complexity, controversy, exploration needs
+- **Automatic Execution**: Runs the selected algorithm and returns results
+- **Selection Transparency**: Logs which algorithm was chosen and why
+
+**Selection Criteria:**
+| Problem Type | Algorithm Selected |
+|--------------|-------------------|
+| Controversial/debate topics | Dialectic |
+| Multiple perspectives | Dialectic |
+| Puzzles, debugging, iteration needed | Reflexion |
+| Creative exploration, brainstorming | Graph of Thoughts |
+| Simple, factual questions | Sequential |
+
+### 2. `sequential_thinking`
 Simple linear chain-of-thought reasoning. Good for straightforward problems.
 
 ```json
@@ -34,7 +73,7 @@ Simple linear chain-of-thought reasoning. Good for straightforward problems.
 }
 ```
 
-### 2. `graph_of_thoughts`
+### 3. `graph_of_thoughts`
 Graph-based reasoning with path merging and optional tool integration. Unlike Tree of Thoughts, GoT can merge similar reasoning paths, combining insights from converging approaches.
 
 ```json
@@ -58,7 +97,7 @@ Graph-based reasoning with path merging and optional tool integration. Unlike Tr
 - UCB1 formula guides exploration vs exploitation
 - **Tool Integration (v3.2)**: Can use calculator, code execution, and web fetch during reasoning
 
-### 3. `reflexion`
+### 4. `reflexion`
 Reasoning with episodic memory and optional tool integration. Makes multiple attempts, learns from failures, and applies lessons from past similar problems.
 
 ```json
@@ -79,7 +118,7 @@ Reasoning with episodic memory and optional tool integration. Makes multiple att
 - Lessons inform new reasoning attempts
 - **Tool Integration (v3.2)**: Can use tools during reasoning for computation and verification
 
-### 4. `dialectic_reason`
+### 5. `dialectic_reason`
 Thesis-antithesis-synthesis reasoning combining Debate and Chain of Verification with optional tool-backed fact-checking.
 
 ```json
@@ -101,10 +140,10 @@ Thesis-antithesis-synthesis reasoning combining Debate and Chain of Verification
 - Each claim is verified for logical soundness
 - **Tool-Backed Verification (v3.2)**: Uses tools to fact-check claims during verification
 
-### 5. `list_providers`
-List available providers and their configuration status.
+### 6. `list_providers`
+List available providers and their configuration status. Now includes **Provider Intelligence** metrics showing performance scores, success rates, and latency.
 
-### 6. `memory_stats`
+### 7. `memory_stats`
 Show reflexion episodic memory statistics.
 
 ## Built-in Tools
@@ -137,7 +176,7 @@ All reasoning tools support streaming output via the `stream: true` parameter:
 |----------|---------|---------------|-------|
 | **zai** (GLM) | `ZAI_API_KEY` | glm-4.7 | z.ai/Zhipu |
 | **openai** | `OPENAI_API_KEY` | gpt-4o-mini | |
-| **anthropic** | `ANTHROPIC_API_KEY` | claude-3-haiku | |
+| **anthropic** | `ANTHROPIC_API_KEY` | claude-sonnet-4-6 | |
 | **groq** | `GROQ_API_KEY` | llama-3.1-70b | Very fast |
 | **deepseek** | `DEEPSEEK_API_KEY` | deepseek-chat | Cheap, good reasoning |
 | **openrouter** | `OPENROUTER_API_KEY` | llama-3.1-70b | Many models |
@@ -167,6 +206,64 @@ export LLM_PROVIDER="groq"           # Force specific provider
 export LLM_MODEL="mixtral-8x7b"      # Force specific model
 export ZAI_BASE_URL="..."            # Custom endpoint for z.ai
 ```
+
+### 2.5 Configuration File (Optional)
+
+Create `reasoning-tools.yaml` in the current directory, `~/.config/reasoning-tools/`, or set `REASONING_TOOLS_CONFIG` to point to your config file.
+
+```yaml
+# reasoning-tools.yaml
+providers:
+  default: "groq"                    # Default provider if no env var set
+  fallbacks:                         # Fallback order on failure
+    - "deepseek"
+    - "ollama"
+
+algorithms:
+  sequential:
+    max_thoughts: 10
+  graph_of_thoughts:
+    branching_factor: 3
+    max_nodes: 30
+    max_depth: 8
+    enable_merging: true
+    merge_threshold: 0.7             # NEW: Configurable similarity threshold
+  reflexion:
+    max_attempts: 3
+  dialectic:
+    max_rounds: 5
+    confidence_target: 0.85
+    fast_mode: false
+
+timeouts:                            # Per-provider timeouts (seconds)
+  openai: 120
+  anthropic: 120
+  groq: 60
+  ollama: 300
+  deepseek: 120
+
+rate_limiting:
+  max_concurrent: 2                  # Max parallel LLM requests
+  max_tokens_cap: 2048               # Default max tokens per request
+
+memory:
+  path: ""                           # Custom memory path (default: ~/.local/share/...)
+  max_episodes: 100                  # Max episodes in reflexion memory
+  ttl_days: 7                        # Episode expiration
+
+tools:
+  calculator: true
+  code_exec: true
+  web_fetch: true
+  string_ops: true
+```
+
+Generate an example config:
+```bash
+reasoning-tools -generate-config > reasoning-tools.yaml
+```
+
+**Priority Order**: Environment variables override config file values.
 
 ### 3. MCP Configuration
 
@@ -369,8 +466,60 @@ Tool-backed verification gathers evidence using calculator, web_fetch, etc.
 | `max_tool_calls` | 10 | Maximum tool calls for verification |
 | `enabled_tools` | (all) | Comma-separated: calculator,code_exec,web_fetch,string_ops |
 
+## Provider Intelligence (NEW in v3.3)
+
+The server tracks provider performance metrics and provides smart fallback:
+
+**Metrics Tracked:**
+- Success/failure rates
+- Average latency
+- Rate limit hits
+- Consecutive failures
+
+**Scoring Algorithm:**
+- Base: 100 points
+- Success rate penalty: up to -40 points
+- Latency penalty: up to -30 points (if avg > 1000ms)
+- Rate limit penalty: up to -15 points
+- Recency bonus: up to +15 points for recent success
+
+**Smart Fallback:**
+When a provider fails, the system:
+1. Checks if error is retryable (transient vs terminal)
+2. Tries configured fallback providers in order
+3. Falls back to highest-scoring available provider
+
+After 3 consecutive failures, a provider is marked unavailable until reset.
+
+View metrics via `list_providers`:
+```
+Provider Intelligence Summary:
+============================
+
+groq (Score: 95.0, available)
+  Requests: 50 total, 49 success (98.0%)
+  Latency: avg 120ms, min 80ms, max 450ms
+
+openai (Score: 85.0, available)
+  Requests: 30 total, 28 success (93.3%)
+  Latency: avg 350ms, min 200ms, max 800ms
+```
+
+## Error Categorization (v3.3)
+
+Errors are now categorized for better handling:
+
+| Category | Retryable | Examples |
+|----------|-----------|----------|
+| **Config** | No | Invalid API key, model not found |
+| **Transient** | Yes | Rate limit, timeout, 503 errors |
+| **Terminal** | No | Bad request, content policy, 401 |
+
+This enables smart retry logic that only retries transient errors.
+
 ## Version History
 
+- **v3.3.0** - Auto-reasoning, Provider Intelligence, YAML config, enhanced memory, error categorization
 - **v3.2.0** - Unified tool integration across GoT, Dialectics, and Reflexion (replaces standalone LATS)
 - **v3.1.0** - Added LATS (Language Agent Tree Search) with built-in tools
 - **v3.0.0** - Added Graph of Thoughts, Reflexion, Streaming Output

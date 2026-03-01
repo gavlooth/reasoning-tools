@@ -79,14 +79,14 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 		return &AnthropicProvider{
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://api.anthropic.com/v1"),
-			model:   withDefault(cfg.Model, "claude-3-haiku-20240307"),
+			model:   withDefault(cfg.Model, "claude-sonnet-4-6"),
 			client:  &http.Client{Timeout: config.AnthropicTimeout},
 		}, nil
 	case "groq":
 		return &OpenAIProvider{
 			apiKey:  cfg.APIKey,
 			baseURL: withDefault(cfg.BaseURL, "https://api.groq.com/openai/v1"),
-			model:   withDefault(cfg.Model, "llama-3.1-70b-versatile"),
+			model:   withDefault(cfg.Model, "llama-3.3-70b-versatile"),
 			client:  &http.Client{Timeout: config.GroqTimeout},
 			name:    "groq",
 		}, nil
@@ -250,6 +250,11 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 		model = p.model
 	}
 
+	// Check for missing API key (config error)
+	if p.apiKey == "" && p.name != "ollama" {
+		return "", NewConfigError("API key not configured", fmt.Errorf("provider %s requires an API key", p.Name()))
+	}
+
 	reqBody := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
@@ -263,7 +268,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return "", NewTerminalError("failed to marshal request", err)
 	}
 
 	var lastErr error
@@ -288,7 +293,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 
 		req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
 		if err != nil {
-			return "", fmt.Errorf("failed to create request: %w", err)
+			return "", NewTerminalError("failed to create request", err)
 		}
 
 		req.Header.Set("Content-Type", "application/json")
@@ -306,7 +311,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 			if isTransientError(err) {
 				continue
 			}
-			return "", fmt.Errorf("request failed: %w", err)
+			return "", WrapWithCategory(err, "request failed")
 		}
 		// Ensure response body is closed on all code paths (defer handles return statements,
 		// but continue statements need explicit close to release resources before next iteration)
@@ -321,20 +326,28 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if resp.StatusCode == http.StatusTooManyRequests {
+			apiErr := fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+
+			// Categorize based on status code
+			switch {
+			case resp.StatusCode == http.StatusTooManyRequests:
 				rateLimitHits++
-				lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-				// Close response body before retrying
+				lastErr = NewTransientError("rate limited", apiErr)
 				resp.Body.Close()
 				continue
-			}
-			if resp.StatusCode >= 500 {
-				lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-				// Close response body before retrying
+			case resp.StatusCode == http.StatusUnauthorized:
+				return "", NewConfigError("authentication failed - check your API key", apiErr)
+			case resp.StatusCode == http.StatusForbidden:
+				return "", NewConfigError("access forbidden - check your API key permissions", apiErr)
+			case resp.StatusCode >= 500:
+				lastErr = NewTransientError("server error", apiErr)
 				resp.Body.Close()
 				continue
+			case resp.StatusCode == http.StatusBadRequest:
+				return "", NewTerminalError("invalid request", apiErr)
+			default:
+				return "", WrapWithCategory(apiErr, "API request failed")
 			}
-			return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 		}
 
 		var chatResp struct {
@@ -350,11 +363,11 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 		}
 
 		if err := json.Unmarshal(body, &chatResp); err != nil {
-			return "", fmt.Errorf("failed to parse response: %w", err)
+			return "", NewTerminalError("failed to parse response", err)
 		}
 
 		if chatResp.Error != nil {
-			return "", fmt.Errorf("API error: %s", chatResp.Error.Message)
+			return "", WrapWithCategory(fmt.Errorf("API error: %s", chatResp.Error.Message), "API returned error")
 		}
 
 		if len(chatResp.Choices) == 0 {
@@ -365,8 +378,10 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 			} else {
 				responseSnippet = string(body)
 			}
-			return "", fmt.Errorf("no choices in API response (provider: %s, model: %s, status: %d, body: %s)",
-				p.Name(), model, resp.StatusCode, responseSnippet)
+			return "", NewTerminalError(
+				fmt.Sprintf("no choices in API response (provider: %s, model: %s)", p.Name(), model),
+				fmt.Errorf("status: %d, body: %s", resp.StatusCode, responseSnippet),
+			)
 		}
 
 		content := chatResp.Choices[0].Message.Content
@@ -381,15 +396,23 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []ChatMessage, opts 
 			} else {
 				responseSnippet = string(body)
 			}
-			return "", fmt.Errorf("empty content in API response (provider: %s, model: %s, status: %d, body: %s)",
-				p.Name(), model, resp.StatusCode, responseSnippet)
+			return "", NewTerminalError(
+				fmt.Sprintf("empty content in API response (provider: %s, model: %s)", p.Name(), model),
+				fmt.Errorf("status: %d, body: %s", resp.StatusCode, responseSnippet),
+			)
 		}
 
 		return content, nil
 	}
 
 	// Note: response body is already closed above on all paths
-	return "", fmt.Errorf("request failed after retries: %w", lastErr)
+	if lastErr != nil {
+		if IsRetryable(lastErr) {
+			return "", NewTransientError("request failed after retries", lastErr)
+		}
+		return "", lastErr
+	}
+	return "", NewTerminalError("request failed after retries", fmt.Errorf("unknown error"))
 }
 
 func isTransientError(err error) bool {

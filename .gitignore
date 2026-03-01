@@ -13,3 +13,13 @@ Thumbs.db
 
 # Local Claude settings
 .claude/
+algorithm_selector
+test_build
+test_syntax
+.clj-kondo/
+.lsp/
+
+# Review files
+ONE_SHOT_*.md
+REVIEW*.md
+Issues.md

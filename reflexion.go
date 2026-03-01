@@ -18,15 +18,52 @@ import (
 
 // Reflexion implements episodic memory and learning from failures
 type Reflexion struct {
-	provider      Provider
-	config        ReflexionConfig
-	memory        *EpisodicMemory
-	tools         *ToolRegistry
-	toolCalls     int
-	toolCallsMu   sync.Mutex
-	onProgress    func(ProgressUpdate)
-	onToken       func(token string)
-	enableStreams bool
+	provider           Provider
+	reasoningProvider  Provider // Provider for generating reasoning (main work)
+	evaluationProvider Provider // Provider for evaluating answers
+	reflectionProvider Provider // Provider for reflecting on failures
+	config             ReflexionConfig
+	memory             *EpisodicMemory
+	tools              *ToolRegistry
+	toolCalls          int
+	toolCallsMu        sync.Mutex
+	onProgress         func(ProgressUpdate)
+	onToken            func(token string)
+	enableStreams      bool
+}
+
+// SetReasoningProvider sets a specific provider for reasoning
+func (r *Reflexion) SetReasoningProvider(p Provider) {
+	r.reasoningProvider = p
+}
+
+// SetEvaluationProvider sets a specific provider for evaluation
+func (r *Reflexion) SetEvaluationProvider(p Provider) {
+	r.evaluationProvider = p
+}
+
+// SetReflectionProvider sets a specific provider for reflection
+func (r *Reflexion) SetReflectionProvider(p Provider) {
+	r.reflectionProvider = p
+}
+
+// getProviderFor returns the appropriate provider for a given phase
+func (r *Reflexion) getProviderFor(phase string) Provider {
+	switch phase {
+	case "reasoning":
+		if r.reasoningProvider != nil {
+			return r.reasoningProvider
+		}
+	case "evaluation":
+		if r.evaluationProvider != nil {
+			return r.evaluationProvider
+		}
+	case "reflection":
+		if r.reflectionProvider != nil {
+			return r.reflectionProvider
+		}
+	}
+	return r.provider
 }
 
 // SetTokenCallback sets a callback for token streaming
@@ -354,8 +391,11 @@ For each step, output a JSON object:
 	}
 	attemptToolCalls := 0
 
+	// Use reasoning provider for generating thoughts
+	provider := r.getProviderFor("reasoning")
+
 	// Check if provider supports streaming
-	streamingProvider, canStream := r.provider.(StreamingProvider)
+	streamingProvider, canStream := provider.(StreamingProvider)
 	useStreaming := canStream && r.enableStreams && streamingProvider.SupportsStreaming()
 
 	for i := 0; i < r.config.MaxThoughtsPerAttempt; i++ {
@@ -372,7 +412,7 @@ For each step, output a JSON object:
 				}
 			})
 		} else {
-			response, err = r.provider.Chat(ctx, messages, ChatOptions{
+			response, err = provider.Chat(ctx, messages, ChatOptions{
 				Temperature: r.config.Temperature,
 				MaxTokens:   1024,
 			})
@@ -531,8 +571,11 @@ Respond with ONLY a JSON object:
 	var response string
 	var err error
 
+	// Use evaluation provider for checking answers
+	provider := r.getProviderFor("evaluation")
+
 	// Check if provider supports streaming
-	if sp, ok := r.provider.(StreamingProvider); ok && r.enableStreams && sp.SupportsStreaming() {
+	if sp, ok := provider.(StreamingProvider); ok && r.enableStreams && sp.SupportsStreaming() {
 		response, err = sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: 0.3,
 			MaxTokens:   512,
@@ -542,7 +585,7 @@ Respond with ONLY a JSON object:
 			}
 		})
 	} else {
-		response, err = r.provider.Chat(ctx, messages, ChatOptions{
+		response, err = provider.Chat(ctx, messages, ChatOptions{
 			Temperature: 0.3,
 			MaxTokens:   512,
 		})
@@ -610,8 +653,11 @@ Respond with just the reflection text, no JSON.`, problem, thoughtsStr.String(),
 	var response string
 	var err error
 
+	// Use reflection provider for analyzing failures
+	provider := r.getProviderFor("reflection")
+
 	// Check if provider supports streaming
-	if sp, ok := r.provider.(StreamingProvider); ok && r.enableStreams && sp.SupportsStreaming() {
+	if sp, ok := provider.(StreamingProvider); ok && r.enableStreams && sp.SupportsStreaming() {
 		response, err = sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: 0.5,
 			MaxTokens:   512,
@@ -621,7 +667,7 @@ Respond with just the reflection text, no JSON.`, problem, thoughtsStr.String(),
 			}
 		})
 	} else {
-		response, err = r.provider.Chat(ctx, messages, ChatOptions{
+		response, err = provider.Chat(ctx, messages, ChatOptions{
 			Temperature: 0.5,
 			MaxTokens:   512,
 		})
@@ -641,11 +687,37 @@ func (r *Reflexion) getPastLessons(problem string) []string {
 	problemHash := hashProblem(problem)
 	var relevantEpisodes []Episode
 
-	// Find episodes with similar problems
+	// Phase 1: Fast filter using simple similarity (word overlap)
+	var candidates []Episode
 	for _, ep := range r.memory.Episodes {
-		// Check for exact match or similar hash
-		if ep.ProblemHash == problemHash || stringSimilarity(ep.Problem, problem) > 0.5 {
+		// Check for exact match first
+		if ep.ProblemHash == problemHash {
 			relevantEpisodes = append(relevantEpisodes, ep)
+			continue
+		}
+		// Simple similarity check for quick filtering
+		if stringSimilarity(ep.Problem, problem) > 0.3 {
+			candidates = append(candidates, ep)
+		}
+	}
+
+	// Phase 2: Use semantic similarity for candidates (if we have provider and not too many)
+	if len(candidates) > 0 && len(candidates) <= 10 && r.provider != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		for _, ep := range candidates {
+			similarity, err := r.computeSemanticSimilarity(ctx, problem, ep.Problem)
+			if err == nil && similarity > 0.6 {
+				relevantEpisodes = append(relevantEpisodes, ep)
+			}
+		}
+	} else if len(candidates) > 0 {
+		// Fall back to simple similarity for many candidates
+		for _, ep := range candidates {
+			if stringSimilarity(ep.Problem, problem) > 0.5 {
+				relevantEpisodes = append(relevantEpisodes, ep)
+			}
 		}
 	}
 
@@ -675,6 +747,54 @@ func (r *Reflexion) getPastLessons(problem string) []string {
 	}
 
 	return lessons
+}
+
+// computeSemanticSimilarity uses the LLM to compute semantic similarity between two problems
+func (r *Reflexion) computeSemanticSimilarity(ctx context.Context, problem1, problem2 string) (float64, error) {
+	prompt := fmt.Sprintf(`Rate the semantic similarity of these two problems on a scale from 0.0 to 1.0.
+Consider:
+- Are they asking about the same topic or domain?
+- Would the same approach or solution work for both?
+- Do they require similar types of reasoning?
+
+0.0 = completely different problems
+0.5 = somewhat related but different
+1.0 = essentially the same problem
+
+Problem 1: %s
+
+Problem 2: %s
+
+Respond with ONLY a decimal number between 0.0 and 1.0.`, problem1, problem2)
+
+	messages := []ChatMessage{
+		{Role: "user", Content: prompt},
+	}
+
+	response, err := r.provider.Chat(ctx, messages, ChatOptions{
+		Temperature: 0.1,
+		MaxTokens:   10,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	// Parse the similarity score
+	response = strings.TrimSpace(response)
+	var score float64
+	_, err = fmt.Sscanf(response, "%f", &score)
+	if err != nil {
+		return 0, err
+	}
+
+	if score < 0 {
+		score = 0
+	}
+	if score > 1 {
+		score = 1
+	}
+
+	return score, nil
 }
 
 // storeEpisode stores a reasoning episode in memory

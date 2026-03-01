@@ -1,0 +1,153 @@
+# Reasoning Tools Configuration
+# Copy this file to ~/.config/reasoning-tools/config.yaml
+
+# ============================================================================
+# API Keys (supports ${VAR_NAME} for environment variables)
+# ============================================================================
+api_keys:
+  # Option 1: Reference environment variables (recommended)
+  zai: ${ZAI_API_KEY}
+  groq: ${GROQ_API_KEY}
+  deepseek: ${DEEPSEEK_API_KEY}
+  openrouter: ${OPENROUTER_API_KEY}
+  together: ${TOGETHER_API_KEY}
+  openai: ${OPENAI_API_KEY}
+  anthropic: ${ANTHROPIC_API_KEY}
+
+  # Option 2: Plain text keys (less secure, not recommended)
+  # zai: "your-actual-api-key-here"
+
+# ============================================================================
+# Provider Settings
+# ============================================================================
+providers:
+  # Default provider when none specified
+  default: zai
+
+  # Fallback providers to try on failure
+  fallbacks:
+    - groq
+    - openai
+
+  # Per-provider configuration (optional, for advanced use)
+  configs:
+    zai:
+      model: glm-4.7
+      # base_url: https://custom-endpoint.com  # Optional override
+    groq:
+      model: llama-3.3-70b-versatile
+    deepseek:
+      model: deepseek-reasoner
+
+  # ============================================================================
+  # Multi-Provider Strategies (NEW!)
+  # ============================================================================
+  strategies:
+    # Cascade: Use cheap provider for initial steps, upgrade to capable later
+    cascade:
+      enabled: true
+      cheap: groq
+      cheap_model: llama-3.3-70b-versatile
+      capable: zai
+      capable_model: glm-4.7
+      upgrade_after_step: 2  # Switch to capable after step N
+
+    # Round Robin: Rotate through multiple providers
+    round_robin:
+      enabled: false
+      providers:
+        - deepseek
+        - zai
+        - groq
+
+# ============================================================================
+# Algorithm-Specific Provider Overrides (NEW!)
+# ============================================================================
+algorithms:
+  # Sequential Thinking - supports cascade/alternating strategies
+  sequential:
+    max_thoughts: 10
+    temperature: 0.7
+    # Uncomment to use cascade strategy for this algorithm
+    # strategy: cascade
+    # cheap_provider: groq
+    # cheap_model: llama-3.3-70b-versatile
+    # capable_provider: deepseek
+    # capable_model: deepseek-reasoner
+
+  # Graph of Thoughts - per-operation providers
+  graph_of_thoughts:
+    branching_factor: 3
+    max_nodes: 30
+    max_depth: 8
+    merge_threshold: 0.7
+    enable_merging: true
+    # Per-operation providers (use cheaper for creative, capable for precise)
+    thought_provider: groq
+    thought_model: llama-3.3-70b-versatile
+    evaluation_provider: zai
+    evaluation_model: glm-4.7
+    merge_provider: zai
+    merge_model: glm-4-flash
+
+  # Reflexion - per-phase providers
+  reflexion:
+    max_attempts: 3
+    learn_from_past: true
+    # Per-phase providers
+    reasoning_provider: groq      # Main reasoning work
+    reasoning_model: llama-3.3-70b-versatile
+    evaluation_provider: zai      # Checking answers
+    evaluation_model: glm-4.7
+    reflection_provider: zai      # Analyzing failures
+    reflection_model: glm-4-flash
+
+  # Dialectic - per-role providers
+  dialectic:
+    max_rounds: 5
+    confidence_target: 0.85
+    fast_mode: false
+    # Per-role providers (use cheaper for exploration, capable for synthesis)
+    thesis_provider: groq
+    thesis_model: llama-3.3-70b-versatile
+    antithesis_provider: groq
+    antithesis_model: llama-3.3-70b-versatile
+    synthesis_provider: zai       # Use most capable for final synthesis
+    synthesis_model: glm-4.7
+
+# ============================================================================
+# Timeouts (in seconds)
+# ============================================================================
+timeouts:
+  openai: 120
+  anthropic: 120
+  groq: 120
+  ollama: 300
+  deepseek: 120
+  openrouter: 120
+  zai: 120
+  together: 120
+  code_exec: 10
+  web_fetch: 15
+
+# ============================================================================
+# Rate Limiting
+# ============================================================================
+rate_limiting:
+  max_concurrent: 2      # Max concurrent LLM requests
+  max_tokens_cap: 8192   # Max tokens per request
+
+# ============================================================================
+# Memory Settings (for Reflexion)
+# ============================================================================
+memory:
+  path: ~/.local/share/reasoning-tools/memory.json
+  max_episodes: 100
+  ttl_days: 0  # 0 = no expiry
+
+# ============================================================================
+# Tool Settings
+# ============================================================================
+tools:
+  enable_code_exec: false
+  enabled_tools: []  # Empty = all tools available

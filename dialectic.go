@@ -16,14 +16,17 @@ import (
 
 // DialecticalReasoner implements Debate + Chain of Verification
 type DialecticalReasoner struct {
-	provider      Provider
-	config        DialecticConfig
-	tools         *ToolRegistry
-	toolCalls     int
-	toolCallsMu   sync.Mutex
-	onProgress    func(ProgressUpdate)
-	onToken       func(token string)
-	enableStreams bool
+	provider        Provider
+	thesisProvider    Provider // Provider for thesis generation (optional)
+	antithesisProvider Provider // Provider for antithesis generation (optional)
+	synthesisProvider  Provider // Provider for synthesis generation (optional)
+	config          DialecticConfig
+	tools           *ToolRegistry
+	toolCalls       int
+	toolCallsMu     sync.Mutex
+	onProgress      func(ProgressUpdate)
+	onToken         func(token string)
+	enableStreams   bool
 }
 
 // DialecticConfig configures the dialectical reasoning process
@@ -40,6 +43,29 @@ type DialecticConfig struct {
 	EnableTools      bool     // Whether to use tools during verification (default: false)
 	MaxToolCalls     int      // Maximum tool calls total (default: 10)
 	EnabledTools     []string // Which tools to enable (empty = all)
+}
+
+// getProviderFor returns the appropriate provider for a given role
+func (d *DialecticalReasoner) getProviderFor(role string) Provider {
+	switch role {
+	case "thesis":
+		if d.thesisProvider != nil {
+			return d.thesisProvider
+		}
+		return d.provider
+	case "antithesis":
+		if d.antithesisProvider != nil {
+			return d.antithesisProvider
+		}
+		return d.provider
+	case "synthesis":
+		if d.synthesisProvider != nil {
+			return d.synthesisProvider
+		}
+		return d.provider
+	default:
+		return d.provider
+	}
 }
 
 // DefaultDialecticConfig returns sensible defaults
@@ -147,6 +173,21 @@ func (d *DialecticalReasoner) SetTokenCallback(cb func(token string)) {
 // SetEnableStreaming enables or disables LLM streaming
 func (d *DialecticalReasoner) SetEnableStreaming(enable bool) {
 	d.enableStreams = enable
+}
+
+// SetThesisProvider sets a specific provider for thesis generation
+func (d *DialecticalReasoner) SetThesisProvider(p Provider) {
+	d.thesisProvider = p
+}
+
+// SetAntithesisProvider sets a specific provider for antithesis generation
+func (d *DialecticalReasoner) SetAntithesisProvider(p Provider) {
+	d.antithesisProvider = p
+}
+
+// SetSynthesisProvider sets a specific provider for synthesis generation
+func (d *DialecticalReasoner) SetSynthesisProvider(p Provider) {
+	d.synthesisProvider = p
 }
 
 func (d *DialecticalReasoner) emitProgress(update ProgressUpdate) {
@@ -343,14 +384,41 @@ CONFIDENCE: 0.0`, problem)
 	var payload fastPayload
 	if jsonStr != "" {
 		if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
-			return result, fmt.Errorf("failed to parse fast dialectic response: %w", err)
+			// JSON was found but parsing failed - log and try text fallback
+			d.emitProgress(ProgressUpdate{
+				Type:    "thought",
+				Message: fmt.Sprintf("JSON parse failed, trying text fallback: %v", err),
+			})
 		}
-	} else {
-		var ok bool
-		payload, ok = parseFastDialecticText(response)
-		if !ok {
-			return result, fmt.Errorf("failed to parse fast dialectic response")
+	}
+	
+	// If JSON parsing didn't give us all fields, try text parsing
+	if payload.Thesis == "" || payload.Antithesis == "" || payload.Synthesis == "" {
+		textPayload, ok := parseFastDialecticText(response)
+		if ok {
+			// Merge: prefer JSON values, fill gaps from text
+			if payload.Thesis == "" {
+				payload.Thesis = textPayload.Thesis
+			}
+			if payload.Antithesis == "" {
+				payload.Antithesis = textPayload.Antithesis
+			}
+			if payload.Synthesis == "" {
+				payload.Synthesis = textPayload.Synthesis
+			}
+			if payload.Confidence == 0 {
+				payload.Confidence = textPayload.Confidence
+			}
 		}
+	}
+	
+	// Final check - if still missing fields, return error with response preview
+	if payload.Thesis == "" || payload.Antithesis == "" || payload.Synthesis == "" {
+		preview := response
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		return result, fmt.Errorf("failed to parse fast dialectic response. Raw response preview: %s", preview)
 	}
 
 	confidence := payload.Confidence
@@ -420,14 +488,15 @@ func parseFastDialecticText(response string) (fastPayload, bool) {
 
 	detectLabel := func(line string) string {
 		lower := strings.ToLower(line)
+		// Check for various label formats
 		switch {
-		case strings.HasPrefix(lower, "thesis"):
+		case strings.HasPrefix(lower, "thesis") || strings.HasPrefix(lower, "**thesis"):
 			return "thesis"
-		case strings.HasPrefix(lower, "antithesis"), strings.HasPrefix(lower, "anti-thesis"):
+		case strings.HasPrefix(lower, "antithesis") || strings.HasPrefix(lower, "anti-thesis") || strings.HasPrefix(lower, "**antithesis"):
 			return "antithesis"
-		case strings.HasPrefix(lower, "synthesis"):
+		case strings.HasPrefix(lower, "synthesis") || strings.HasPrefix(lower, "**synthesis"):
 			return "synthesis"
-		case strings.HasPrefix(lower, "confidence"):
+		case strings.HasPrefix(lower, "confidence") || strings.HasPrefix(lower, "**confidence"):
 			return "confidence"
 		default:
 			return ""
@@ -442,7 +511,14 @@ func parseFastDialecticText(response string) (fastPayload, bool) {
 		}
 
 		if label := detectLabel(line); label != "" {
-			remainder := strings.TrimSpace(line[len(label):])
+			// Handle **Label:** markdown format
+			remainder := line
+			for _, prefix := range []string{"**", "thesis", "antithesis", "synthesis", "confidence"} {
+				if strings.HasPrefix(strings.ToLower(remainder), prefix) {
+					remainder = remainder[len(prefix):]
+				}
+			}
+			remainder = strings.TrimLeft(remainder, "*")
 			remainder = strings.TrimLeft(remainder, ":-–— \t")
 			current = label
 			if remainder != "" {
@@ -484,24 +560,29 @@ func parseFastDialecticText(response string) (fastPayload, bool) {
 		}
 	}
 
+	// Try to extract from numbered/bulleted lists if sections are empty
 	if thesis == "" || antithesis == "" || synthesis == "" {
-		var fallback []string
+		var items []string
 		for _, raw := range lines {
 			line := normalizeLine(raw)
-			if line == "" {
+			if line == "" || detectLabel(line) != "" {
 				continue
 			}
-			fallback = append(fallback, line)
+			// Skip lines that look like metadata
+			if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "---") {
+				continue
+			}
+			items = append(items, line)
 		}
-		if len(fallback) >= 3 {
-			if thesis == "" {
-				thesis = fallback[0]
+		if len(items) >= 3 {
+			if thesis == "" && len(items) > 0 {
+				thesis = items[0]
 			}
-			if antithesis == "" {
-				antithesis = fallback[1]
+			if antithesis == "" && len(items) > 1 {
+				antithesis = items[1]
 			}
-			if synthesis == "" {
-				synthesis = fallback[2]
+			if synthesis == "" && len(items) > 2 {
+				synthesis = items[2]
 			}
 		}
 	}
@@ -563,8 +644,10 @@ IMPORTANT: Output ONLY your thesis statement (1-3 sentences). No analysis steps,
 		{Role: "user", Content: prompt},
 	}
 
+	provider := d.getProviderFor("thesis")
+
 	// Check if provider supports streaming
-	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
+	if sp, ok := provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		result, err := sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: clampTemperature(d.config.Temperature),
 			MaxTokens:   d.config.MaxTokens,
@@ -577,7 +660,7 @@ IMPORTANT: Output ONLY your thesis statement (1-3 sentences). No analysis steps,
 		return utils.StripChainOfThought(result), err
 	}
 
-	result, err := d.provider.Chat(ctx, messages, ChatOptions{
+	result, err := provider.Chat(ctx, messages, ChatOptions{
 		Temperature: clampTemperature(d.config.Temperature),
 		MaxTokens:   d.config.MaxTokens,
 		Model:       d.config.ThesisModel,
@@ -610,8 +693,10 @@ Just state your counterargument directly.`, problem, thesis, issuesContext)
 		{Role: "user", Content: prompt},
 	}
 
+	provider := d.getProviderFor("antithesis")
+
 	// Check if provider supports streaming
-	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
+	if sp, ok := provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		result, err := sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: clampTemperature(d.config.Temperature + 0.1), // Slightly higher for creativity
 			MaxTokens:   d.config.MaxTokens,
@@ -624,7 +709,7 @@ Just state your counterargument directly.`, problem, thesis, issuesContext)
 		return utils.StripChainOfThought(result), err
 	}
 
-	result, err := d.provider.Chat(ctx, messages, ChatOptions{
+	result, err := provider.Chat(ctx, messages, ChatOptions{
 		Temperature: clampTemperature(d.config.Temperature + 0.1), // Slightly higher for creativity
 		MaxTokens:   d.config.MaxTokens,
 		Model:       d.config.AntithesisModel,
@@ -655,8 +740,10 @@ Just provide your synthesized conclusion directly.`,
 		{Role: "user", Content: prompt},
 	}
 
+	provider := d.getProviderFor("synthesis")
+
 	// Check if provider supports streaming
-	if sp, ok := d.provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
+	if sp, ok := provider.(StreamingProvider); ok && d.enableStreams && sp.SupportsStreaming() {
 		result, err := sp.ChatStream(ctx, messages, ChatOptions{
 			Temperature: clampTemperature(d.config.Temperature - 0.1), // Slightly lower for precision
 			MaxTokens:   d.config.MaxTokens,
@@ -669,7 +756,7 @@ Just provide your synthesized conclusion directly.`,
 		return utils.StripChainOfThought(result), err
 	}
 
-	result, err := d.provider.Chat(ctx, messages, ChatOptions{
+	result, err := provider.Chat(ctx, messages, ChatOptions{
 		Temperature: clampTemperature(d.config.Temperature - 0.1), // Slightly lower for precision
 		MaxTokens:   d.config.MaxTokens,
 		Model:       d.config.SynthesisModel,

@@ -11,9 +11,138 @@ import (
 	"reasoning-tools/utils"
 )
 
+// ProviderSelector chooses providers per step based on strategy
+type ProviderSelector struct {
+	primary      Provider
+	cheap        Provider
+	capable      Provider
+	providers    []Provider    // For round_robin strategy - list of providers to cycle through
+	strategy     string        // "single", "cascade", "alternating", "round_robin", "custom"
+	upgradeAfter int           // Switch from cheap to capable after N steps
+	stepMapping  map[int]int   // step -> provider index (for custom)
+}
+
+// SelectProvider returns the provider to use for a given step
+func (ps *ProviderSelector) SelectProvider(stepNum int) Provider {
+	switch ps.strategy {
+	case "cascade":
+		// Use cheap for first N steps, then upgrade to capable
+		if stepNum <= ps.upgradeAfter && ps.cheap != nil {
+			return ps.cheap
+		}
+		if ps.capable != nil {
+			return ps.capable
+		}
+		return ps.primary
+
+	case "alternating":
+		// Alternate between cheap and capable
+		if stepNum%2 == 1 && ps.cheap != nil {
+			return ps.cheap
+		}
+		if ps.capable != nil {
+			return ps.capable
+		}
+		return ps.primary
+
+	case "round_robin":
+		// Cycle through providers list
+		if len(ps.providers) > 0 {
+			idx := (stepNum - 1) % len(ps.providers) // step 1 -> idx 0, step 2 -> idx 1, etc.
+			return ps.providers[idx]
+		}
+		return ps.primary
+
+	case "custom":
+		// Use step mapping (maps step number to provider index)
+		if ps.stepMapping != nil {
+			if idx, ok := ps.stepMapping[stepNum]; ok && idx < len(ps.providers) {
+				return ps.providers[idx]
+			}
+		}
+		// Fallback to round_robin
+		if len(ps.providers) > 0 {
+			idx := (stepNum - 1) % len(ps.providers)
+			return ps.providers[idx]
+		}
+		return ps.primary
+
+	default: // "single"
+		return ps.primary
+	}
+}
+
+// Name returns a description of the current provider selection
+func (ps *ProviderSelector) Name() string {
+	if ps.strategy == "single" {
+		return ps.primary.Name()
+	}
+	if ps.strategy == "round_robin" && len(ps.providers) > 0 {
+		names := make([]string, len(ps.providers))
+		for i, p := range ps.providers {
+			names[i] = p.Name()
+		}
+		return fmt.Sprintf("round_robin(%s)", strings.Join(names, "->"))
+	}
+	if ps.cheap != nil && ps.capable != nil {
+		return fmt.Sprintf("%s(%s->%s)", ps.strategy, ps.cheap.Name(), ps.capable.Name())
+	}
+	return ps.primary.Name()
+}
+
+// Strategy returns the current strategy
+func (ps *ProviderSelector) Strategy() string {
+	return ps.strategy
+}
+
+// NewProviderSelector creates a provider selector from config
+func NewProviderSelector(primary, cheap, capable Provider, strategy string, upgradeAfter int) *ProviderSelector {
+	return &ProviderSelector{
+		primary:      primary,
+		cheap:        cheap,
+		capable:      capable,
+		strategy:     strategy,
+		upgradeAfter: upgradeAfter,
+	}
+}
+
+// NewProviderSelectorWithMapping creates a provider selector with custom step mapping
+func NewProviderSelectorWithMapping(primary, cheap, capable Provider, strategy string, upgradeAfter int, stepMapping map[int]string) *ProviderSelector {
+	return &ProviderSelector{
+		primary:      primary,
+		cheap:        cheap,
+		capable:      capable,
+		strategy:     strategy,
+		upgradeAfter: upgradeAfter,
+	}
+}
+
+// NewProviderSelectorRoundRobin creates a selector that cycles through providers
+func NewProviderSelectorRoundRobin(providers []Provider) *ProviderSelector {
+	return &ProviderSelector{
+		primary:   providers[0], // Fallback
+		providers: providers,
+		strategy:  "round_robin",
+	}
+}
+
+// NewProviderSelectorWithProviders creates a selector with a list of providers and optional custom mapping
+func NewProviderSelectorWithProviders(providers []Provider, strategy string, stepMapping map[int]int) *ProviderSelector {
+	primary := providers[0]
+	if len(providers) > 0 {
+		primary = providers[0]
+	}
+	return &ProviderSelector{
+		primary:     primary,
+		providers:   providers,
+		strategy:    strategy,
+		stepMapping: stepMapping,
+	}
+}
+
 // SequentialClient performs simple linear sequential thinking
 type SequentialClient struct {
-	provider      Provider
+	selector      *ProviderSelector
 	onProgress    func(ProgressUpdate)
 	onToken       func(token string)
 	enableStreams bool
@@ -103,7 +232,7 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 		Problem:  problem,
 		Steps:    []ThinkingStep{},
 		Success:  false,
-		Provider: c.provider.Name(),
+		Provider: c.selector.Name(),
 	}
 
 	messages := []ChatMessage{
@@ -111,21 +240,24 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 		{Role: "user", Content: fmt.Sprintf("Problem to solve:\n\n%s\n\nBegin your sequential thinking process.", problem)},
 	}
 
-	// Check if provider supports streaming
-	streamingProvider, canStream := c.provider.(StreamingProvider)
-	useStreaming := canStream && c.enableStreams && streamingProvider.SupportsStreaming()
-
 	for i := 0; i < maxThoughts; i++ {
+		// Select provider for this step
+		provider := c.selector.SelectProvider(i + 1)
+
 		// Emit progress: generating thought
 		c.emitProgress(ProgressUpdate{
 			Type:    EventTypeProgress,
 			NodeID:  fmt.Sprintf("t%d", i+1),
-			Message: fmt.Sprintf("Generating thought %d...", i+1),
+			Message: fmt.Sprintf("Generating thought %d (via %s)...", i+1, provider.Name()),
 			Depth:   i + 1,
 		})
 
 		var response string
 		var err error
+
+		// Check if provider supports streaming
+		streamingProvider, canStream := provider.(StreamingProvider)
+		useStreaming := canStream && c.enableStreams && streamingProvider.SupportsStreaming()
 
 		// Call LLM with or without streaming
 		if useStreaming {
@@ -138,7 +270,7 @@ func (c *SequentialClient) Think(ctx context.Context, problem string, maxThought
 				}
 			})
 		} else {
-			response, err = c.provider.Chat(ctx, messages, ChatOptions{
+			response, err = provider.Chat(ctx, messages, ChatOptions{
 				Temperature: 0.7,
 				MaxTokens:   2048,
 			})

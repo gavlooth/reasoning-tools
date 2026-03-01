@@ -104,6 +104,30 @@ func main() {
 		mcp.WithString("fallback_providers",
 			mcp.Description("Comma-separated list of fallback providers to try on failure"),
 		),
+		mcp.WithString("provider_strategy",
+			mcp.Description("Provider selection strategy: 'single' (default), 'cascade' (cheap then capable), 'alternating', 'round_robin', 'custom'"),
+		),
+		mcp.WithString("providers",
+			mcp.Description("Comma-separated providers for round_robin/custom: 'deepseek,zai,groq' or 'deepseek:deepseek-reasoner,zai:glm-4.7,groq:llama-3.3-70b'"),
+		),
+		mcp.WithString("cheap_provider",
+			mcp.Description("Cheap provider for initial steps (e.g., 'ollama', 'groq'). Used with cascade/alternating strategies."),
+		),
+		mcp.WithString("cheap_model",
+			mcp.Description("Model for cheap provider"),
+		),
+		mcp.WithString("capable_provider",
+			mcp.Description("Capable provider for complex steps (e.g., 'deepseek', 'zai'). Used with cascade/alternating strategies."),
+		),
+		mcp.WithString("capable_model",
+			mcp.Description("Model for capable provider"),
+		),
+		mcp.WithNumber("upgrade_after_step",
+			mcp.Description("Switch from cheap to capable after N steps (default: 2). Used with cascade strategy."),
+		),
+		mcp.WithString("step_mapping",
+			mcp.Description("Custom step mapping: '1:0,2:1,3:2' (indices into providers list). Used with custom strategy."),
+		),
 		mcp.WithBoolean("stream",
 			mcp.Description("Include streaming event log in output (default: false)"),
 		),
@@ -141,6 +165,9 @@ func main() {
 		mcp.WithNumber("max_depth",
 			mcp.Description("Maximum reasoning depth (default: 8)"),
 		),
+		mcp.WithNumber("merge_threshold",
+			mcp.Description("Similarity threshold 0-1 for merging paths (default: 0.7)"),
+		),
 		mcp.WithBoolean("enable_merging",
 			mcp.Description("Allow merging similar paths (default: true)"),
 		),
@@ -158,6 +185,15 @@ func main() {
 		),
 		mcp.WithString("model",
 			mcp.Description("Model to use (provider-specific)"),
+		),
+		mcp.WithString("thought_provider",
+			mcp.Description("Provider for generating thoughts: groq, zai, deepseek, etc. (creative, diverse)"),
+		),
+		mcp.WithString("evaluation_provider",
+			mcp.Description("Provider for evaluating thoughts: deepseek, zai, etc. (analytical, precise)"),
+		),
+		mcp.WithString("merge_provider",
+			mcp.Description("Provider for merging paths: zai, deepseek, etc. (synthesis)"),
 		),
 		mcp.WithString("fallback_providers",
 			mcp.Description("Comma-separated list of fallback providers to try on failure"),
@@ -210,6 +246,15 @@ func main() {
 		),
 		mcp.WithString("model",
 			mcp.Description("Model to use (provider-specific)"),
+		),
+		mcp.WithString("reasoning_provider",
+			mcp.Description("Provider for reasoning: groq, zai, deepseek, etc. (main reasoning work)"),
+		),
+		mcp.WithString("evaluation_provider",
+			mcp.Description("Provider for evaluation: deepseek, zai, etc. (checking answers)"),
+		),
+		mcp.WithString("reflection_provider",
+			mcp.Description("Provider for reflection: zai, deepseek, etc. (analyzing failures)"),
 		),
 		mcp.WithString("fallback_providers",
 			mcp.Description("Comma-separated list of fallback providers to try on failure"),
@@ -278,6 +323,15 @@ func main() {
 		mcp.WithString("synthesis_model",
 			mcp.Description("Override model for synthesis generation (provider-specific)"),
 		),
+		mcp.WithString("thesis_provider",
+			mcp.Description("Provider for thesis generation: deepseek, zai, groq, openai, etc."),
+		),
+		mcp.WithString("antithesis_provider",
+			mcp.Description("Provider for antithesis generation: deepseek, zai, groq, openai, etc."),
+		),
+		mcp.WithString("synthesis_provider",
+			mcp.Description("Provider for synthesis generation: deepseek, zai, groq, openai, etc."),
+		),
 		mcp.WithString("fallback_providers",
 			mcp.Description("Comma-separated list of fallback providers to try on failure"),
 		),
@@ -298,6 +352,28 @@ func main() {
 		),
 	)
 	s.AddTool(dialecticTool, handleDialecticReason)
+
+	// Register auto-reasoning tool
+	autoTool := mcp.NewTool("auto_reason",
+		mcp.WithDescription("Automatically selects and runs the best reasoning algorithm for the given problem. Analyzes the problem type and chooses between sequential, graph-of-thoughts, reflexion, or dialectic reasoning."),
+		mcp.WithString("problem",
+			mcp.Required(),
+			mcp.Description("The problem or question to solve"),
+		),
+		mcp.WithString("provider",
+			mcp.Description("LLM provider: openai, anthropic, groq, ollama, deepseek, openrouter, zai, together"),
+		),
+		mcp.WithString("model",
+			mcp.Description("Model to use (provider-specific)"),
+		),
+		mcp.WithString("analysis_provider",
+			mcp.Description("Provider for problem analysis (cheaper model): groq, zai, etc."),
+		),
+		mcp.WithBoolean("quick_select",
+			mcp.Description("Use fast heuristic-based selection instead of LLM analysis (default: false)"),
+		),
+	)
+	s.AddTool(autoTool, handleAutoReason)
 
 	// Register provider list tool
 	listTool := mcp.NewTool("list_providers",
@@ -464,8 +540,8 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 		maxThoughts = int(mt)
 	}
 
-	// Get provider
-	provider, err := getProviderFromArgsForTool(args, "sequential_thinking")
+	// Get provider selector (supports multi-provider strategies)
+	selector, err := getProviderSelectorForTool(args, "sequential_thinking")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
 	}
@@ -476,8 +552,8 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 	// Set up progress tracking
 	sc.SetProgressTotal(maxThoughts)
 
-	// Create client with streaming callbacks
-	client := &SequentialClient{provider: provider}
+	// Create client with provider selector
+	client := &SequentialClient{selector: selector}
 
 	// Set progress callback for event streaming
 	client.SetProgressCallback(func(update ProgressUpdate) {
@@ -497,11 +573,11 @@ func handleSequentialThink(ctx context.Context, request mcp.CallToolRequest) (*m
 	// Enable LLM streaming if token streaming is requested
 	client.SetEnableStreaming(sc.Mode.ShouldStreamTokens())
 
-	// Cache (only when not streaming)
+	// Cache (only when not streaming and using single provider)
 	cache := getToolCache()
 	cacheKey := ""
-	if cache != nil && sc.Mode == StreamModeNone {
-		cacheKey = buildToolCacheKey("sequential_thinking", provider.Name(), args)
+	if cache != nil && sc.Mode == StreamModeNone && selector.Strategy() == "single" {
+		cacheKey = buildToolCacheKey("sequential_thinking", selector.Name(), args)
 		if cached, ok := cache.Get(cacheKey); ok {
 			return mcp.NewToolResultText(cached), nil
 		}
@@ -567,6 +643,11 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 	if md, ok := args["max_depth"].(float64); ok {
 		config.MaxDepth = int(md)
 	}
+	if mt, ok := args["merge_threshold"].(float64); ok {
+		if mt >= 0 && mt <= 1 {
+			config.MergeThreshold = mt
+		}
+	}
 	if em, ok := args["enable_merging"].(bool); ok {
 		config.EnableMerging = em
 	}
@@ -597,6 +678,29 @@ func handleGraphOfThoughts(ctx context.Context, request mcp.CallToolRequest) (*m
 
 	// Run Graph of Thoughts
 	got := NewGraphOfThoughts(provider, config)
+
+	// Set operation-specific providers if specified
+	if providerType := getStringArgOrEnv(args, "thought_provider", toolEnvKey("graph_of_thoughts", "THOUGHT_PROVIDER")); providerType != "" {
+		thoughtProvider, err := buildProvider(providerType, "")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Thought provider error: %v", err)), nil
+		}
+		got.SetThoughtProvider(thoughtProvider)
+	}
+	if providerType := getStringArgOrEnv(args, "evaluation_provider", toolEnvKey("graph_of_thoughts", "EVALUATION_PROVIDER")); providerType != "" {
+		evalProvider, err := buildProvider(providerType, "")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Evaluation provider error: %v", err)), nil
+		}
+		got.SetEvaluationProvider(evalProvider)
+	}
+	if providerType := getStringArgOrEnv(args, "merge_provider", toolEnvKey("graph_of_thoughts", "MERGE_PROVIDER")); providerType != "" {
+		mergeProvider, err := buildProvider(providerType, "")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Merge provider error: %v", err)), nil
+		}
+		got.SetMergeProvider(mergeProvider)
+	}
 
 	// Set up progress tracking
 	sc.SetProgressTotal(config.MaxNodes)
@@ -689,6 +793,29 @@ func handleReflexion(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 
 	// Run Reflexion
 	reflexion := NewReflexion(provider, config)
+
+	// Set phase-specific providers if specified
+	if providerType := getStringArgOrEnv(args, "reasoning_provider", toolEnvKey("reflexion", "REASONING_PROVIDER")); providerType != "" {
+		reasoningProvider, err := buildProvider(providerType, "")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Reasoning provider error: %v", err)), nil
+		}
+		reflexion.SetReasoningProvider(reasoningProvider)
+	}
+	if providerType := getStringArgOrEnv(args, "evaluation_provider", toolEnvKey("reflexion", "EVALUATION_PROVIDER")); providerType != "" {
+		evalProvider, err := buildProvider(providerType, "")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Evaluation provider error: %v", err)), nil
+		}
+		reflexion.SetEvaluationProvider(evalProvider)
+	}
+	if providerType := getStringArgOrEnv(args, "reflection_provider", toolEnvKey("reflexion", "REFLECTION_PROVIDER")); providerType != "" {
+		reflectProvider, err := buildProvider(providerType, "")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Reflection provider error: %v", err)), nil
+		}
+		reflexion.SetReflectionProvider(reflectProvider)
+	}
 
 	// Set up progress tracking (each attempt has ~3 phases: attempt, evaluate, reflect)
 	sc.SetProgressTotal(config.MaxAttempts * 3)
@@ -809,6 +936,29 @@ func handleDialecticReason(ctx context.Context, request mcp.CallToolRequest) (*m
 	// Run dialectical reasoning
 	reasoner := NewDialecticalReasoner(provider, config)
 
+	// Set role-specific providers if specified
+	if providerType := getStringArgOrEnv(args, "thesis_provider", toolEnvKey("dialectic_reason", "THESIS_PROVIDER")); providerType != "" {
+		thesisProvider, err := buildProvider(providerType, config.ThesisModel)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Thesis provider error: %v", err)), nil
+		}
+		reasoner.SetThesisProvider(thesisProvider)
+	}
+	if providerType := getStringArgOrEnv(args, "antithesis_provider", toolEnvKey("dialectic_reason", "ANTITHESIS_PROVIDER")); providerType != "" {
+		antithesisProvider, err := buildProvider(providerType, config.AntithesisModel)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Antithesis provider error: %v", err)), nil
+		}
+		reasoner.SetAntithesisProvider(antithesisProvider)
+	}
+	if providerType := getStringArgOrEnv(args, "synthesis_provider", toolEnvKey("dialectic_reason", "SYNTHESIS_PROVIDER")); providerType != "" {
+		synthesisProvider, err := buildProvider(providerType, config.SynthesisModel)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Synthesis provider error: %v", err)), nil
+		}
+		reasoner.SetSynthesisProvider(synthesisProvider)
+	}
+
 	// Set up progress tracking (each round has ~3 phases: thesis, antithesis, synthesis)
 	totalSteps := config.MaxRounds * 3
 	if config.FastMode {
@@ -887,7 +1037,7 @@ func handleListProviders(ctx context.Context, request mcp.CallToolRequest) (*mcp
 		{
 			"name":          "anthropic",
 			"env_key":       "ANTHROPIC_API_KEY",
-			"default_model": "claude-3-haiku-20240307",
+			"default_model": "claude-sonnet-4-6",
 			"base_url":      "https://api.anthropic.com/v1",
 		},
 		{
@@ -926,9 +1076,29 @@ func handleListProviders(ctx context.Context, request mcp.CallToolRequest) (*mcp
 		},
 	}
 
-	// Check which are configured
+	// Check which are configured and add performance metrics
+	intel := GetProviderIntelligence()
 	for i := range providers {
-		providers[i]["configured"] = isProviderConfigured(providers[i]["name"].(string))
+		name := providers[i]["name"].(string)
+		providers[i]["configured"] = isProviderConfigured(name)
+
+		// Add performance metrics from provider intelligence
+		metrics := intel.GetMetrics(name)
+		if metrics != nil {
+			metrics.mu.RLock()
+			score := intel.CalculateScore(name)
+			providers[i]["score"] = score
+			providers[i]["available"] = metrics.IsAvailable
+			providers[i]["total_requests"] = metrics.TotalRequests
+			providers[i]["success_rate"] = 0.0
+			if metrics.TotalRequests > 0 {
+				providers[i]["success_rate"] = float64(metrics.SuccessCount) / float64(metrics.TotalRequests) * 100
+			}
+			if metrics.SuccessCount > 0 {
+				providers[i]["avg_latency_ms"] = metrics.TotalLatencyMs / metrics.SuccessCount
+			}
+			metrics.mu.RUnlock()
+		}
 	}
 
 	output, err := json.MarshalIndent(providers, "", "  ")
@@ -963,6 +1133,71 @@ func handleMemoryStats(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 		output, _ = json.MarshalIndent(fallback, "", "  ")
 	}
 	return mcp.NewToolResultText(string(output)), nil
+}
+
+func handleAutoReason(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	problem, ok := args["problem"].(string)
+	if !ok || problem == "" {
+		return mcp.NewToolResultError("problem parameter is required"), nil
+	}
+
+	// Get provider
+	provider, err := getProviderFromArgsForTool(args, "auto_reason")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Provider error: %v", err)), nil
+	}
+
+	// Check for analysis provider (cheaper model for problem classification)
+	analysisProvider := provider
+	if providerType := getStringArgOrEnv(args, "analysis_provider", toolEnvKey("auto_reason", "ANALYSIS_PROVIDER")); providerType != "" {
+		analysisProvider, err = buildProvider(providerType, "")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Analysis provider error: %v", err)), nil
+		}
+	}
+
+	// Check for quick select mode
+	quickSelect, _ := args["quick_select"].(bool)
+
+	// Run auto-reasoning with separate analysis and execution providers
+	result, algorithm, err := AutoReasonWithProviders(ctx, analysisProvider, provider, problem, quickSelect)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Auto-reason failed: %v", err)), nil
+	}
+
+	// Format result based on algorithm type
+	var output string
+	switch algorithm {
+	case AlgorithmGoT:
+		if got, ok := result.(*GoTResult); ok {
+			output = FormatGoTResult(got)
+		}
+	case AlgorithmReflexion:
+		if ref, ok := result.(*ReflexionResult); ok {
+			output = FormatReflexionResult(ref)
+		}
+	case AlgorithmDialectic:
+		if dia, ok := result.(*DialecticResult); ok {
+			output = FormatDialecticResult(dia)
+		}
+	}
+
+	if output == "" {
+		// Fallback to JSON (including sequential which doesn't have a formatter)
+		jsonResult, _ := json.MarshalIndent(result, "", "  ")
+		output = string(jsonResult)
+	}
+
+	// Add algorithm info header
+	header := fmt.Sprintf("## Auto-Selected Algorithm: %s\n\n", algorithm)
+	output = header + output
+
+	return mcp.NewToolResultText(output), nil
 }
 
 func getStringArgOrEnv(args map[string]interface{}, argName, envKey string) string {
